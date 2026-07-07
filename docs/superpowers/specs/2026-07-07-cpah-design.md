@@ -521,6 +521,7 @@ README 须写清：获取方式、运行命令、key 在目标机如何安全配
 - 替换为 `MockLLM` 后，所有 harness 核心机制仍可通过 pytest
 - 覆盖率 ≥ 80%（`pytest --cov=cpa_harness`）
 - 不依赖网络、不依赖真实 LLM
+- 详细测试策略与一键测试命令见 §11
 
 ### 10.4 文档验收
 
@@ -536,23 +537,193 @@ README 须写清：获取方式、运行命令、key 在目标机如何安全配
 
 ---
 
-## 11. 风险与未决问题 (Risks & Open Questions)
+## 11. 测试策略 (Test Strategy)
 
-（待写）
+> **本节是 A 文件 §A.4-C 与通用要求 §3.6 的具体落地**：TDD 强制 +
+> 一键测试 + 机制可单测。
+
+### 11.1 测试金字塔
+
+```
+         ╱  ╲
+        ╱ E2E ╲         ← 端到端（WebUI/CLI 真跑）
+       ╱────────╲
+      ╱ 集成测试  ╲       ← 多个模块协作（带 mock LLM）
+     ╱──────────────╲
+    ╱   单元测试      ╲   ← 单个函数/类（带 mock LLM）
+   ╱════════════════════╲
+```
+
+| 层 | 数量 | 速度 | 覆盖什么 | 是否需要真 LLM |
+|---|------|------|---------|---------------|
+| **单元** | 多数 | < 1s / 个 | ActionClassifier、HITL 状态机、FeedbackParser、MemoryStore、SandboxBackend | 不需要（MockLLM） |
+| **集成** | 一些 | 几秒 | 完整一轮 loop、危险动作被拦截的端到端路径 | 不需要（MockLLM 编程回放） |
+| **E2E** | 少量 | 30s+ | WebUI 上传、CLI 一条命令跑 | **需要**真 LLM（仅手动跑，不进 CI） |
+
+**核心原则**：CI 跑单元 + 集成（不依赖网络、可离线），E2E 单独跑
+（手测或 nightly job）。
+
+### 11.2 TDD 流程（每个 task 强制执行）
+
+按 `test-driven-development` 技能的标准三步：
+
+1. **红 (Red)**: 写一个失败的测试，明确表达"这个功能应该如何行为"
+   - 例如：`test_classify_blocks_rm_rf_root()` 断言
+     `classify("rm -rf /")` 返回 `Level.BLOCKED`
+   - 运行 → 看到 FAIL（红）
+   - **commit**: `test(guardrail): add failing test for rm -rf / classification`
+2. **绿 (Green)**: 写**最少代码**让测试通过
+   - 加一个正则匹配 `/rm\s+-rf\s+\//` 返回 `BLOCKED`
+   - 运行 → 看到 PASS（绿）
+   - **commit**: `feat(guardrail): implement L0 pattern matcher for rm -rf`
+3. **重构 (Refactor)**: 改进代码可读性、可扩展性，**测试保持绿**
+   - 把正则提到 `L0_PATTERNS` 常量、加注释
+   - 运行 → 仍然 PASS
+   - **commit**: `refactor(guardrail): extract L0 patterns to constant`
+
+**绝对禁止** "先写实现再补测试"——一旦发现，task 视为未完成。
+
+### 11.3 MockLLM：单测能不依赖真 LLM 的关键
+
+`LLMProvider` 是个 Protocol。`MockLLM` 是其中一个实现，**接收预编程
+的对话序列**，每轮按序列返回下一个 `(text, action)`：
+
+```python
+class MockLLM(LLMProvider):
+    def __init__(self, script: list[MockTurn]):
+        self.script = script
+        self.index = 0
+
+    def chat(self, messages, menu) -> tuple[str, Action]:
+        turn = self.script[self.index]
+        self.index += 1
+        if turn.raise_:
+            raise turn.raise_
+        return turn.text, turn.action
+```
+
+测试时：
+
+```python
+def test_guardrail_blocks_dangerous_command():
+    mock = MockLLM(script=[
+        MockTurn(text="我先看看", action=Action(
+            type="call_tool", tool="exec_command",
+            args={"cmd": "rm -rf /", "cwd": "/tmp"})),
+    ])
+    h = build_harness(llm=mock, ...)
+    h.run("清理一下")
+    assert mock.index == 1   # agent 一轮就拿到拦截结果
+    # 验证：拦截原因被回灌、文件未删
+```
+
+**关键好处**：测试**确定性**——同一个 script，每次跑结果一样，CI 不会
+偶发失败。
+
+### 11.4 一键测试命令
+
+| 形态 | 命令 | 跑什么 |
+|------|------|--------|
+| **开发** | `make test` 或 `pytest` | 单元 + 集成 |
+| **看覆盖率** | `make test-cov` 或 `pytest --cov=cpa_harness --cov-report=term-missing` | 单元 + 集成 + 覆盖率 |
+| **特定模块** | `pytest tests/test_guardrail.py` | 单文件 |
+| **特定函数** | `pytest tests/test_guardrail.py::test_classify_blocks_rm_rf_root` | 单测点 |
+| **E2E（手动）** | `make e2e` 或 `pytest tests/e2e/ --run-e2e` | 真 LLM，需 `OPENAI_API_KEY` |
+
+`Makefile` 是项目入口，**初版 PLAN 第一个 task 就是建它**。
+
+### 11.5 机制演示（满足 A 文件 §A.6）
+
+提交 `tests/demo_mechanisms.py`，覆盖：
+
+1. **护栏拦截** — `MockLLM` 编程发出 `rm -rf /`，断言
+   `ActionClassifier.classify` 返回 `BLOCKED`，harness 把"被拦截"
+   回灌，下一轮 LLM 改换策略
+2. **反馈闭环** — `MockLLM` 编程先发 `write_file` 写错代码；`MockSandbox`
+   返回 `FeedbackReport(verdict=CE, line=5)`；下一轮 `MockLLM` 编程发
+   `write_file` 修第 5 行；断言第二次 `write_file` 的 content **确实改了
+   第 5 行**（不是别的位置）
+3. **主角维度（治理）的确定性行为** — `MockLLM` 发 `write_file` 覆盖
+   学生原 `.c`；断言 harness 进入 `awaiting_approval` 状态；学生
+   `reject`；断言 harness 进入 `blocked` 状态、文件**未变**、context
+   被回灌"被学生拒绝"
+
+演示**必须**用 mock 跑，不依赖网络，CI 里必过。
+
+### 11.6 覆盖率策略
+
+- **必须 ≥ 80%**: `pytest --cov=cpa_harness --cov-fail-under=80`
+- **重点覆盖**（90%+）:
+  - `cpa_harness.guardrails` (主角维度)
+  - `cpa_harness.feedback` (解析逻辑)
+  - `cpa_harness.tools` (工具分发)
+- **可适度降低**（60%+）:
+  - `cpa_harness.web` (FastAPI 路由层，集成测试覆盖)
+  - `cpa_harness.cli` (入口，集成测试覆盖)
+
+### 11.7 测试与实现的对应关系
+
+每个 §5/§6 设计的机制，**在写实现之前**就要在 `tests/` 下有对应
+的测试文件存在（即使它是红的状态）：
+
+| 机制 | 测试文件 |
+|------|---------|
+| ActionClassifier | `tests/test_guardrail_classifier.py` |
+| HITL 状态机 | `tests/test_hitl_state_machine.py` |
+| Sandbox (chdir + ulimit) | `tests/test_sandbox.py` |
+| Sandbox 跨平台 (job object) | `tests/test_sandbox_windows.py` (条件 skip) |
+| gcc 错误解析 | `tests/test_feedback_gcc.py` |
+| valgrind 解析 | `tests/test_feedback_valgrind.py` |
+| MemoryStore | `tests/test_memory_store.py` |
+| AgentLoop (完整一轮) | `tests/test_agent_loop.py` |
+| 机制演示 | `tests/demo_mechanisms.py` |
 
 ---
 
-## 12. 凭据威胁模型 (Credentials Threat Model)
+## 12. 风险与未决问题 (Risks & Open Questions)
 
-（待写：与 §4.2 安全 对应）
+- **R1**: LLM 在 `function_calling` 模式下偶发不调工具、直接给文本答
+  案 → 风险：循环中规中矩触发不到反馈；缓解：让 `MockLLM` 测试覆盖
+  这种 case
+- **R2**: Windows 上 `pywin32` 安装链路不稳 → 缓解：沙箱接口已抽象为
+  Protocol，沙箱在 Windows 上的实现可后期插入；初版可仅在 Linux 跑
+  E2E
+- **R3**: 阿里云 / 腾讯云学生额度到 2026 年政策可能调整 → 缓解：保留
+  Docker 本地运行作为基础保障
+- **R4**: OpenAI 兼容接口的各家模型对 function calling 支持差异 → 缓
+  解：选 1-2 家主推模型（OpenAI 官方 + DeepSeek），不强求兼容所有
+- **R5**: 学生同时上传 10 个文件 → 单测覆盖少量文件场景即可，大规模
+  E2E 不在首版范围
 
 ---
 
-## 13. 反思 (Reflection)
+## 13. 凭据威胁模型 (Credentials Threat Model)
 
-（待项目结束后在 REFLECTION.md 中写）
+与 §4.2 / §8 对应。
+
+| 威胁 ID | 威胁 | 攻击路径 | 对策 | 残留风险 |
+|---------|------|---------|------|---------|
+| T-1 | 真实 API key 入 Git 仓库 | 写代码时把 key 粘进字符串字面量 | pre-commit hook 跑 `gitleaks`；CI 跑 `gitleaks detect`；`.env` / `*.key` 在 `.gitignore` | 误用环境变量名打印到日志 |
+| T-2 | keyring 拿不到 key（首次运行） | 学生第一次启动 | 引导流程：`cpa-harness setup` 隐藏输入；明确写明"key 存在哪、谁能看" | 学生误把 key 通过不安全的渠道传同学 |
+| T-3 | `.env` 文件泄漏（备选方案） | 部署到云上时挂错目录 | Dockerfile 不带 `.env`；部署时用 `docker run -e KEY=...` 或 docker secret | 中间人能看到 env |
+| T-4 | 凭据查询时回显明文 | `cpa-harness key status` 写错 | 状态只显示前缀（`sk-xxxx...abcde`），绝不打印完整 key | 社工骗完整 key |
+| T-5 | CI 日志泄漏 secret | CI 配错把 env 打印出来 | CI job 不打印 `$OPENAI_API_KEY`；用 `::add-mask::` 标记 | 第三方包未 mask 误打 |
+| T-6 | 进程 fork 泄漏 key 给子进程 | sandbox 子进程继承 env | sandbox 启动前 `os.environ` 清掉 `*_KEY` / `*_TOKEN` | 学生未察觉子进程也是 harness 启动的 |
+
+**对策落地位置**（每条都要有代码 + 测试）：
+
+- T-1: `tests/test_no_hardcoded_secrets.py` + pre-commit + CI
+- T-2: `src/cpa_harness/credentials/setup.py`
+- T-3: `.dockerignore` + Dockerfile 校验
+- T-4: `src/cpa_harness/credentials/status.py` + 单测
+- T-5: `.gitlab-ci.yml` 不 `set -x`，敏感变量用 `::add-mask::`
+- T-6: `src/cpa_harness/sandbox/env.py` + 沙箱单测
 
 ---
 
-> **接下来要做的**：写完 §6-§12 的内容，然后 SPEC 自检 → 你审阅 → 进入
-> writing-plans。
+## 14. 反思 (Reflection)
+
+> 反思报告在 `REFLECTION.md` 中独立写，§13 仅放标题占位。
+> 反思内容按通用要求 §五的"反思报告（REFLECTION.md）建议内容"展开。
+
+---
