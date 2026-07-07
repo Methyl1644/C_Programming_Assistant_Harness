@@ -723,7 +723,7 @@ def test_guardrail_blocks_dangerous_command():
 
 ## 14. 反思 (Reflection)
 
-> 反思报告在 `REFLECTION.md` 中独立写，§13 仅放标题占位。
+> 反思报告在 `REFLECTION.md` 中独立写，§14 仅放标题占位。
 > 反思内容按通用要求 §五的"反思报告（REFLECTION.md）建议内容"展开。
 
 ---
