@@ -192,20 +192,32 @@ Harness 内部分为 6 个模块，对应 A 文件 §A.1 的六个维度（决�
        ▼
    [awaiting_approval]  ── approve ──→ [running]
        │                ── reject  ──→ [blocked]
-       │                ── modify  ──→ [action_modified] → [awaiting_approval]
+       │                ── edit    ──→ [action_modified] → [awaiting_approval]
        ▼
    [running]  ── done  ──→ [agent_idle]
                   fail  ──→ [failed]
 ```
+
+> "edit" 含义：学生在 WebUI 上能修改 agent 提议的 args（例如改
+> `write_file` 的 content、改 `exec_command` 的 cmd），但不能修改
+> 工具名 / 也不能"批准一个 deny 动作"。修改后回到 `awaiting_approval`
+> 由学生再点一次 approve。
 
 **沙箱 (Sandbox)**:
 
 - **chdir**: 强制切到 `workspaces/{session_id}/`，所有相对路径解析基于此
 - **路径白名单**: 任何 `..` 或绝对路径（除了白名单内的）→ 拦截
 - **环境清理**: 清空 `HOME`、`PATH`、所有 `*_TOKEN`、`*_KEY` 环境变量
-- **资源限制**: `ulimit -t 5`（CPU 5秒）、`ulimit -v 262144`（256MB 虚拟内存）
+- **资源限制**:
+  - Linux/macOS: `resource.setrlimit(RLIMIT_CPU, 5)`、`RLIMIT_AS = 256MB`
+  - Windows: 用 subprocess 的 `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP`
+    + `job object` 限制（`pywin32` 的 `win32job` 模块，或退回 `timeout`
+    杀进程 + RSS 轮询）。**沙箱接口统一，但实现分平台**——通过
+    `SandboxBackend` Protocol 抽象，单元测试用 in-memory backend。
 - **网络**: 防火墙规则拒绝所有出站（Linux 用 `nft`/iptables；Windows 用
   `netsh`），子进程继承；或更简单——命令黑名单 + 解析 LLM 想跑什么
+- **单文件 vs 多文件**: `run_feedback(target)` 的 `target` 可以是单文件
+  路径，也可以是目录路径（递归编译所有 `.c`）。这是 §10.1 AC-1 的前提。
 
 ### 5.4 记忆 (Memory)
 
@@ -224,31 +236,303 @@ Harness 内部分为 6 个模块，对应 A 文件 §A.1 的六个维度（决�
 
 ## 6. 系统架构 (Architecture)
 
-（待写：组件图、数据流、错误处理、依赖）
+### 6.1 组件图
+
+```
+                   ┌────────────────────────────────────────┐
+                   │              WebUI (FastAPI)            │
+                   │  浏览器 SPA + WebSocket (HITL 审批)     │
+                   └──────────────────┬─────────────────────┘
+                                      │ HTTP/WS
+                                      │
+        ┌─────────────────────────────▼─────────────────────────────┐
+        │                   Harness 核心（自实现）                  │
+        │                                                            │
+        │   ┌────────────┐  ┌────────────┐  ┌──────────────────┐    │
+        │   │ AgentLoop  │→ │ LLM Client │→ │ LLM Provider     │    │
+        │   │  (主循环)  │  │ (抽象层)   │  │ (OpenAI/Claude/  │    │
+        │   │            │  │            │  │  MockLLM)        │    │
+        │   └─────┬──────┘  └────────────┘  └──────────────────┘    │
+        │         │                                                 │
+        │         ▼                                                 │
+        │   ┌────────────────────┐   ┌──────────────────────┐      │
+        │   │  ToolRegistry      │   │  Action Classifier   │      │
+        │   │  (8 个工具)         │   │  (L0/L1/L2/L3 + 细)   │      │
+        │   └─────┬──────────────┘   └──────────┬───────────┘      │
+        │         │                              │                  │
+        │         │         ┌────────────────────┘                  │
+        │         ▼         ▼                                       │
+        │   ┌──────────────────────────────────────┐                │
+        │   │     Guardrail Pipeline                │                │
+        │   │  Policy → Sandbox → HITL → Hooks      │                │
+        │   └──────────────┬───────────────────────┘                │
+        │                  │                                        │
+        │   ┌──────────────▼───────────────────────┐                │
+        │   │  Feedback Sensors (gcc/valgrind/diff) │                │
+        │   └──────────────┬───────────────────────┘                │
+        │                  │                                        │
+        │   ┌──────────────▼───────────────────────┐                │
+        │   │  MemoryStore (4 层) + Tracer          │                │
+        │   └──────────────────────────────────────┘                │
+        └────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                          ┌─────────────────────┐
+                          │  外部世界             │
+                          │  - OpenAI / Claude   │
+                          │  - gcc / valgrind    │
+                          │  - keyring           │
+                          │  - workspaces/       │
+                          └─────────────────────┘
+```
+
+### 6.2 数据流（一轮循环）
+
+```
+                ┌──────────────────────────────────────┐
+                │  上一轮的 (text, action, observation) │
+                └──────────────────┬───────────────────┘
+                                   ▼
+              ┌─────────────────────────────────────────┐
+              │  ContextBuilder 拼装                    │
+              │  = system + rules + memory.read +       │
+              │    retriever.retrieve + 历史            │
+              └──────────────────┬──────────────────────┘
+                                 ▼
+                ┌────────────────────────────────────┐
+                │  LLM Provider.chat(messages, menu) │
+                │  → (text, action, tool_call?)      │
+                └──────────────────┬─────────────────┘
+                                   ▼
+                ┌────────────────────────────────────┐
+                │  决策入上下文  +  Tracer.record     │
+                └──────────────────┬─────────────────┘
+                                   ▼
+                ┌────────────────────────────────────┐
+                │  action.type == "done"?  → 退出     │
+                └──────────────────┬─────────────────┘
+                                   ▼
+                ┌────────────────────────────────────┐
+                │  ActionClassifier.classify(action) │
+                │  → L0/L1/L2/L3  (含 L2a/b/c)       │
+                └──────────────────┬─────────────────┘
+                                   ▼
+                ┌────────────────────────────────────┐
+                │  L0 / L2c → 拦截，回灌，继续         │
+                │  L1 / L2b → HITL 等审批             │
+                │  L2a / L3 → 放行                    │
+                └──────────────────┬─────────────────┘
+                                   ▼
+                ┌────────────────────────────────────┐
+                │  Sandbox.run(tool, args)            │
+                │  chdir + ulimit + env 清理           │
+                └──────────────────┬─────────────────┘
+                                   ▼
+                ┌────────────────────────────────────┐
+                │  Feedback Sensors 解析产物           │
+                │  (若 changed_code 触发)              │
+                └──────────────────┬─────────────────┘
+                                   ▼
+                ┌────────────────────────────────────┐
+                │  observation 入上下文，下一轮         │
+                └────────────────────────────────────┘
+```
+
+### 6.3 错误处理
+
+| 错误 | 处理 |
+|------|------|
+| LLM 调用超时 / 5xx | 重试 2 次，仍失败 → 把错误信息回灌 context，让 agent 决定继续还是退出 |
+| LLM 返回非法 JSON | 解析失败 → 把"原始字符串 + 解析错误"回灌，让 agent 改换格式 |
+| 沙箱内 subprocess 崩 | exit_code + signal 收集到 observation，不算 harness 错 |
+| 学生上传超大文件 (>1MB) | 启动时拒绝，不进入循环 |
+| WebUI 断连 | CLI 模式下回退到默认 deny（拒绝所有 L1/L2 动作） |
+| keyring 拿不到 key | 引导用户首次录入；非交互环境下报 fatal 退出 |
+
+### 6.4 外部依赖
+
+- **OpenAI Python SDK** (`openai>=1.0`)：调用 LLM
+- **keyring** (`keyring>=24`)：跨平台凭据存储
+- **FastAPI** + **uvicorn**：WebUI
+- **pydantic**：数据模型 / schema
+- **pytest** + **pytest-asyncio**：测试
+- **ruff** + **mypy**：lint / 类型检查
+- **Docker**（可选）：分发形态
 
 ---
 
 ## 7. 数据模型 (Data Models)
 
-（待写：Action / Observation / Memory 三元组）
+### 7.1 Action (Pydantic model)
+
+```python
+class Action(BaseModel):
+    type: Literal["call_tool", "use_skill", "take_note",
+                  "finish_tutoring", "done"]
+    tool: str | None = None
+    args: dict = {}
+    note: str | None = None
+    summary: str | None = None
+```
+
+### 7.2 Observation
+
+```python
+class Observation(BaseModel):
+    tool: str
+    result: str          # 工具原始输出
+    exit_code: int | None = None
+    signal: int | None = None
+    feedback: FeedbackReport | None = None   # 见 7.3
+    duration_ms: int
+```
+
+### 7.3 FeedbackReport (六类信号)
+
+```python
+class FeedbackReport(BaseModel):
+    verdict: Literal["AC", "CE", "WA", "TLE", "MLE", "RE"]
+    file: str
+    line: int | None = None
+    col: int | None = None
+    severity: Literal["error", "warning"] | None = None
+    msg: str
+    snippet: str | None = None        # CE: 前后 3 行
+    expected: str | None = None       # WA
+    actual: str | None = None         # WA
+    signal_name: str | None = None    # RE
+    rss_mb: float | None = None       # MLE
+    leak_summary: str | None = None   # MLE / valgrind
+```
+
+### 7.4 MemoryRecord
+
+```python
+class MemoryRecord(BaseModel):
+    user_id: str
+    kind: Literal["note", "history", "lesson", "preference"]
+    content: str
+    created_at: datetime
+    tags: list[str] = []
+```
+
+### 7.5 关系
+
+- 一轮循环 = (text, action, observation) 三元组
+- 一个 session = 多轮三元组 + 起始 goal
+- 一次跨会话记忆 = 多个 MemoryRecord 关联同一 user_id
 
 ---
 
 ## 8. 凭据与分发 (Credentials & Distribution)
 
-（待写：keyring 方案、Docker 镜像、CI/CD）
+### 8.1 凭据存储（威胁模型见 §12）
+
+| 形态 | 实现 | 适用 |
+|------|------|------|
+| **主方案** | `keyring` 库（macOS Keychain / Windows Credential Manager / Linux Secret Service） | 全平台默认 |
+| **Fallback** | `.env` 文件（明确警告：明文） | 无 GUI 的服务器 / CI |
+| **CI 特殊** | 环境变量（来自 CI secret store） | GitHub Actions / GitLab CI |
+
+### 8.2 首次运行引导
+
+- 启动时若拿不到 `OPENAI_API_KEY`，进入交互式引导
+- CLI: `cpa-harness setup` → 隐藏输入 → 写入 keyring
+- WebUI: 首次访问设置页 → 同上
+- 用户可执行 `cpa-harness key status` / `update` / `clear`
+- **状态查询时绝不回显明文**
+
+### 8.3 分发形态
+
+**主形态: Docker 镜像**（满足通用要求 §3.2"单条 docker run 可启动"）
+
+```bash
+docker build -t cpa-harness .
+docker run -it \
+  -e CPAH_OPENAI_API_KEY_FILE=/run/secrets/key \
+  -v $(pwd)/workspaces:/app/workspaces \
+  -p 8000:8000 \
+  cpa-harness
+```
+
+**次形态: PyPI 包**
+
+```bash
+pip install cpa-harness
+cpa-harness serve   # 启动 WebUI
+```
+
+README 须写清：获取方式、运行命令、key 在目标机如何安全配置、已知限制（平台 / 架构 / 依赖前提）。
+
+### 8.4 云部署
+
+候选：阿里云 / 腾讯云（学生免费额度）+ Docker 镜像。
+
+部署架构：
+- 1 台轻量级 ECS（2 vCPU / 2GB）跑 WebUI
+- keyring 改为读环境变量（云上无系统 keychain）
+- 反向代理 nginx + HTTPS
 
 ---
 
 ## 9. 技术选型与理由 (Tech Choices)
 
-（待写：Python 3.11、FastAPI、OpenAI SDK、pytest）
+| 选择 | 选项 | 决定 | 理由 |
+|------|------|------|------|
+| 语言 | Python 3.11+ / TypeScript / Go / Rust | **Python 3.11** | LLM 生态最成熟（OpenAI SDK、pydantic）；学生有过一点 Python 基础；与 §A.4 强调的"自己实现 harness"不冲突——harness 本身不依赖任何 agent 框架 |
+| Web 框架 | Flask / FastAPI / Django | **FastAPI** | 异步、WebSocket 一等公民、pydantic 集成、auto OpenAPI 文档 |
+| LLM 客户端 | openai-sdk / langchain / 直接 HTTP | **openai-sdk** | 官方 SDK、覆盖 OpenAI 兼容接口（DeepSeek / 硅基流动 / Azure） |
+| LLM Provider 抽象 | 不抽象 / 自己写 | **自己写**（`LLMProvider` Protocol + `MockLLM` / `OpenAILLM`） | A 文件 §A.4-A 硬要求"可注入 mock"；可单测 |
+| 测试框架 | pytest / unittest | **pytest** | 简洁、fixture 强大、CI 标准 |
+| 沙箱 | Docker / chroot / 进程级 | **进程级**（subprocess + chdir + ulimit + 命令黑名单） | 跨平台、代码可控、满足 A 文件 §A.4-C 的单测要求 |
+| 凭据 | 环境变量 / keyring / 自建 | **keyring 优先 + .env fallback** | 跨平台明文风险最小 |
+| 进程内分发 | Docker / PyPI / Homebrew | **Docker + PyPI 双形态** | Docker 满足"一条命令跑起来"；PyPI 满足 §3.2 多种形态 |
+| Open Design | 必填 | **不适用**（CLI 后端项目，豁免） | §3.6 允许纯 CLI / 纯后端项目豁免 |
 
 ---
 
 ## 10. 验收标准 (Acceptance Criteria)
 
-（待写：每个功能"完成"的客观判定标准；含 §A.6 的机制演示要求）
+每条标准都是**客观、可验证**的——评阅人跑一遍就知道过没过。
+
+### 10.1 功能验收
+
+| ID | 标准 | 验证方式 |
+|----|------|---------|
+| AC-1 | 学生上传 `main.c`，30s 内拿到 CE 报告（精确到行号） | 端到端 demo：故意写一段错代码，验证 |
+| AC-2 | 学生代码有内存泄漏，10s 内拿到 MLE 报告 | 端到端 demo：故意 `malloc` 不 `free`，验证 |
+| AC-3 | 学生在 WebUI 看到 agent 提议的 diff，**必须点 "Approve" 才会写入** | 端到端 demo：拒绝 → 文件未变；批准 → 文件改变 |
+| AC-4 | agent 试图跑 `rm -rf /`，**harness 直接拦截**，不弹 HITL | 单元测试：构造危险 action，断言被拦 |
+| AC-5 | agent 试图读 `/etc/passwd`，**harness 拦截** | 单元测试 |
+| AC-6 | agent 提议的 `write_file` 覆盖学生原 `.c`，**WebUI 弹 L1 HITL** | 端到端 demo |
+| AC-7 | LLM 给出错误答案（WA），agent 收到反馈后**下一轮调整代码** | 端到端 demo + 单元测试 |
+| AC-8 | 同一 user_id 第二次提问，agent **记得上次讨论的概念** | 端到端 demo（重启 server 后再问） |
+
+### 10.2 A 文件 §A.6 机制演示（必交）
+
+提交一个**确定性可重复**的演示脚本，覆盖：
+
+1. **护栏拦截** — 注入危险命令，断言 harness 拦截
+2. **反馈闭环** — 注入失败，反馈回灌后 agent 改变下一步
+3. **主角维度（治理）的确定性行为** — 例如：HITL 状态机在拒绝时正确回退、不写入、不污染上下文
+
+### 10.3 单元测试验收
+
+- 替换为 `MockLLM` 后，所有 harness 核心机制仍可通过 pytest
+- 覆盖率 ≥ 80%（`pytest --cov=cpa_harness`）
+- 不依赖网络、不依赖真实 LLM
+
+### 10.4 文档验收
+
+- `SPEC.md`、`PLAN.md`、`SPEC_PROCESS.md`、`AGENT_LOG.md`、`REFLECTION.md` 全部存在
+- README 含：项目简介 / 安装 / 运行 / 分发 / 目录结构 / 安全边界
+- CI 中存在 `unit-test` job，且最后一次跑必须 pass
+
+### 10.5 部署验收
+
+- `docker build` 成功
+- `docker run` 启动后 WebUI 可访问
+- 公网 URL 可在截止前访问
 
 ---
 
