@@ -1,0 +1,10 @@
+# Default CP-AH configuration
+max_steps: 30
+max_tokens: 8000
+sandbox_cpu_seconds: 5
+sandbox_memory_mb: 256
+dangerous_command_hitl: true
+default_model: gpt-4o-mini
+feedback:
+  compile_flags: "-Wall -Werror"
+  valgrind_flags: "--error-exitcode=1"
