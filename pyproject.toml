@@ -1,0 +1,12 @@
+[project]
+name = "cpa-harness"
+version = "0.1.0"
+description = "Guardrail-first Coding Agent Harness for C language learners"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cpa_harness"]
