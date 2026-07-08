@@ -13,8 +13,13 @@ _GCC_LINE = re.compile(
 
 
 def parse_gcc(stderr: str, file: str = "") -> FeedbackReport | None:
-    errors: list[FeedbackReport] = []
-    warnings: list[FeedbackReport] = []
+    """Parse gcc's 'file:line:col: severity: msg' format.
+
+    Returns the first error, the first warning if no errors, or None.
+    Short-circuits on the first error so we don't accumulate the rest
+    (no caller cares about subsequent errors when one is fatal).
+    """
+    first_warning: FeedbackReport | None = None
     for line in stderr.splitlines():
         m = _GCC_LINE.match(line)
         if not m:
@@ -31,11 +36,7 @@ def parse_gcc(stderr: str, file: str = "") -> FeedbackReport | None:
             msg=m["msg"],
         )
         if severity == "error":
-            errors.append(report)
-        elif severity == "warning":
-            warnings.append(report)
-    if errors:
-        return errors[0]
-    if warnings:
-        return warnings[0]
-    return None
+            return report
+        if first_warning is None:
+            first_warning = report
+    return first_warning
