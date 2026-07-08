@@ -159,4 +159,57 @@ git push -u origin main       # 第一次 push
 | WebUI + Docker + 部署 + 反思 | 0 / 4 | 0% |
 | **总进度** | **10 / 36** | **28%** |
 
+---
+
+## 2026-07-07 · 阶段：实施开始
+
+### 任务 T1.1：项目骨架（Task 1 第一步）
+
+| 字段 | 值 |
+|------|---|
+| **时间** | 2026-07-07 19:00 |
+| **task 编号** | T1.1 |
+| **触发的技能** | `test-driven-development` |
+| **关键 commit** | `4860b36` |
+| **新增文件** | `pyproject.toml`, `src/cpa_harness/__init__.py`, `tests/__init__.py`, `tests/test_skeleton.py` |
+
+### TDD 循环（实际跑通）
+
+1. **RED**: 写 `tests/test_skeleton.py`（assert import + version）
+2. **运行**: `pytest tests/test_skeleton.py -v` → FAIL with "No module named 'cpa_harness'"
+3. **GREEN**: 写 `src/cpa_harness/__init__.py` (`__version__ = "0.1.0"`) + `tests/__init__.py`
+4. **运行**: FAIL still (src/ not in path)
+5. **GREEN (cont'd)**: 写 `pyproject.toml` (hatchling backend, src/ layout)
+6. **运行**: `pip install -e .` + pytest → **1 passed in 0.02s**
+
+### 学到的教训
+
+- **L7（环境）**：本机多个 Python 版本 (3.13.7 / 3.12.7 / 3.14)，统一用 `D:\anaconda\python.exe` (3.12.7) 跑测试——它带 pytest 7.4.4
+- **L8（editable install）**：hatchling 默认支持 `pip install -e .`；装上后 `cpa_harness` 才能 import
+- **L9（工作流）**：用户的反馈"lost in the middle"是对的——我之前一直在 clarification 模式问问题，没有真正开始 TDD。这次跑下来发现 TDD 速度其实比问问题快
+
+### 下次会话的 Task 1 继续点
+
+按 PLAN Task 1，下一步该写：
+- `Makefile`（5 个 entry point: test / test-cov / lint / typecheck / e2e）
+- `pytest.ini`（含 e2e marker）
+- `ruff.toml`（lint 规则）
+- `conftest.py`（共享 fixture：tmp_workspace）
+- 扩展 `test_skeleton.py`（加 tmp_workspace fixture 测试）
+- `.gitlab-ci.yml`（unit-test job + lint + gitleaks）
+- `.pre-commit-config.yaml`（ruff + gitleaks）
+
+### 进度（截至 19:00）
+
+| 阶段 | 完成 / 总数 | 百分比 |
+|------|-----------|--------|
+| Brainstorming | 8 / 8 | 100% |
+| Writing Plans | 1 / 1 | 100% |
+| Git Push | 1 / 1 | 100% |
+| 实现 (Task 1-18) | 1 / 18 | 6% |
+| 冷启动验证 + 文档 | 0 / 4 | 0% |
+| WebUI + Docker + 部署 + 反思 | 0 / 4 | 0% |
+| **总进度** | **11 / 36** | **31%** |
+
+
 
