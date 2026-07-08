@@ -3,6 +3,29 @@ name = "cpa-harness"
 version = "0.1.0"
 description = "Guardrail-first Coding Agent Harness for C language learners"
 requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0",
+    "pydantic>=2.0",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+    "keyring>=24",
+    "pyyaml>=6.0",
+    "httpx>=0.24",
+    "websockets>=11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+    "mypy>=1.0",
+    "types-PyYAML",
+]
+
+[project.scripts]
+cpa-harness = "cpa_harness.cli:main"
 
 [build-system]
 requires = ["hatchling"]
