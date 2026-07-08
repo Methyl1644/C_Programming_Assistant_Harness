@@ -115,4 +115,48 @@ git push -u origin main       # 第一次 push
 - 验证 8 个 commit + 文件结构
 - 告诉 AI push 状态，AI 帮你建 issue 看板
 
+---
+
+## 2026-07-07 · 阶段：会话保存
+
+### 任务 0.7：写 RESUMING.md + 会话记录 + 收尾
+
+| 字段 | 值 |
+|------|---|
+| **时间** | 2026-07-07 18:30 |
+| **task 编号** | T0.7 |
+| **关键 commit** | 即将 commit（最后一个） |
+| **产出文件** | `RESUMING.md` + `docs/sessions/2026-07-07-session-1.md` |
+
+### 目的
+
+让**任何** AI / **任何** 时间接手项目时，能在 5 分钟内：
+1. 读 `RESUMING.md` 了解项目是什么
+2. 读 `AGENTS.md` 知道工作规则
+3. 读 SPEC + PLAN 知道设计 + 实施步骤
+4. 跑 `git log --oneline` 看历史
+5. 问用户"接下来做什么"
+
+### 用户视角
+
+本次会话从零到 SPEC+PLAN+GitHub 全部就绪。用户在 Steam++ 加速器下成功 push 9 个 commit。
+
+### 下次会话
+
+1. 读 `RESUMING.md` → 知道做什么
+2. 读 SPEC §5.3 + PLAN Task 4-5 → 知道主角维度怎么实现
+3. 用 subagent-driven-development 跑 Task 1，按 TDD 三步走
+
+### 状态（截至 18:30）
+
+| 阶段 | 完成 / 总数 | 百分比 |
+|------|-----------|--------|
+| Brainstorming | 8 / 8 | 100% |
+| Writing Plans | 1 / 1 | 100% |
+| Git Push | 1 / 1 | 100% |
+| 实现 (Task 1-18) | 0 / 18 | 0% |
+| 冷启动验证 + 文档 | 0 / 4 | 0% |
+| WebUI + Docker + 部署 + 反思 | 0 / 4 | 0% |
+| **总进度** | **10 / 36** | **28%** |
+
 
