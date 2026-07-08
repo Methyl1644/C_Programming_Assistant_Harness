@@ -356,11 +356,12 @@ Harness 内部分为 6 个模块，对应 A 文件 §A.1 的六个维度（决�
 
 - **OpenAI Python SDK** (`openai>=1.0`)：调用 LLM
 - **keyring** (`keyring>=24`)：跨平台凭据存储
-- **FastAPI** + **uvicorn**：WebUI
+- **FastAPI** + **uvicorn**：WebUI 后端（API + WebSocket + 静态文件 serve）
 - **pydantic**：数据模型 / schema
 - **pytest** + **pytest-asyncio**：测试
 - **ruff** + **mypy**：lint / 类型检查
 - **Docker**（可选）：分发形态
+- **Open Design**（开发时工具，非运行时依赖）：生成 WebUI 前端 HTML 原型；生成后 HTML 放入 `src/cpa_harness/web/static/`，FastAPI 直接 serve，**运行时不依赖 Open Design**
 
 ---
 
@@ -490,7 +491,7 @@ README 须写清：获取方式、运行命令、key 在目标机如何安全配
 | 沙箱 | Docker / chroot / 进程级 | **进程级**（subprocess + chdir + ulimit + 命令黑名单） | 跨平台、代码可控、满足 A 文件 §A.4-C 的单测要求 |
 | 凭据 | 环境变量 / keyring / 自建 | **keyring 优先 + .env fallback** | 跨平台明文风险最小 |
 | 进程内分发 | Docker / PyPI / Homebrew | **Docker + PyPI 双形态** | Docker 满足"一条命令跑起来"；PyPI 满足 §3.2 多种形态 |
-| Open Design | 必填 | **不适用**（CLI 后端项目，豁免） | §3.6 允许纯 CLI / 纯后端项目豁免 |
+| Open Design | 必填 | **使用 Open Design** 生成 WebUI 前端原型 | §3.6"强烈推荐 Open Design"；§五 #9"必须提供 WebUI 接口"。Open Design 生成单页 HTML artifact，FastAPI 作为静态文件 serve。选 **Linear** 设计系统（简洁、适合教学工具） |
 
 ---
 
