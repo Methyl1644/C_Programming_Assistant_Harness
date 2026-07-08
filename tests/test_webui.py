@@ -28,7 +28,10 @@ def test_upload_file_returns_session_id(client, tmp_path):
     assert len(data["session_id"]) > 0
 
 
-def test_ask_with_mock_returns_result(client):
+def test_ask_with_mock_returns_result(client, monkeypatch, tmp_path):
+    # Ensure no API key leaks from other tests
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("CPAH_KEYRING_PATH", str(tmp_path / "nonexistent.json"))
     # First upload a file
     upload_resp = client.post(
         "/api/upload",

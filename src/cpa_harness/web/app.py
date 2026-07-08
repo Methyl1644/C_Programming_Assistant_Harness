@@ -139,7 +139,10 @@ async def key_status():
 async def key_set(req: KeyRequest):
     if not req.key.strip():
         raise HTTPException(status_code=400, detail="empty key")
-    store_api_key(req.key.strip())
+    try:
+        store_api_key(req.key.strip())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"存储失败: {e}")
     return {"ok": True, "masked": mask_key(req.key.strip())}
 
 

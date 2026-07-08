@@ -20,9 +20,9 @@ def test_echo_runs_on_windows(tmp_path):
     assert "hello" in r.stdout
 
 
-def test_secret_env_stripped_on_windows(tmp_path):
+def test_secret_env_stripped_on_windows(tmp_path, monkeypatch):
     sb = WindowsSandbox(workspace=str(tmp_path))
-    os.environ["OPENAI_API_KEY"] = "sk-supersecret-12345"
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-supersecret-12345")
     r = sb.run(
         "exec_command",
         {"cmd": "echo OPENAI_KEY=%OPENAI_API_KEY%"},

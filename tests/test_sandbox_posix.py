@@ -13,10 +13,10 @@ def test_echo_command_runs():
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
-def test_sandbox_clears_secret_env():
+def test_sandbox_clears_secret_env(monkeypatch):
     sb = PosixSandbox(workspace="/tmp")
     secret_value = "sk-supersecret-12345"
-    os.environ["OPENAI_API_KEY"] = secret_value
+    monkeypatch.setenv("OPENAI_API_KEY", secret_value)
     r = sb.run("exec_command",
                {"cmd": "echo OPENAI_KEY=$OPENAI_API_KEY"},
                cwd="/tmp")
@@ -25,9 +25,9 @@ def test_sandbox_clears_secret_env():
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
-def test_sandbox_clears_token_env():
+def test_sandbox_clears_token_env(monkeypatch):
     sb = PosixSandbox(workspace="/tmp")
-    os.environ["MY_TOKEN"] = "leakable"
+    monkeypatch.setenv("MY_TOKEN", "leakable")
     r = sb.run("exec_command",
                {"cmd": "echo TOKEN=$MY_TOKEN"},
                cwd="/tmp")

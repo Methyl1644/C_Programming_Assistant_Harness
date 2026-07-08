@@ -21,7 +21,14 @@ def _keyring_path() -> Path:
 
 
 def _use_keyring_lib() -> bool:
-    """Return True if the system keyring is available."""
+    """Return True if the system keyring is available.
+
+    Currently disabled on Windows — Credential Manager backend is flaky.
+    File fallback works reliably everywhere.
+    """
+    import sys
+    if sys.platform == "win32":
+        return False
     if os.environ.get("CPAH_TEST_KEYRING_BACKEND") == "file":
         return False
     try:

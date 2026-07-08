@@ -162,17 +162,21 @@ settingsBtn.addEventListener('click', async () => {
 document.getElementById('saveKeyBtn').addEventListener('click', async () => {
   const key = keyInput.value.trim();
   if (!key) { keyStatus.innerHTML = '<span style="color:var(--danger)">请输入 key</span>'; return; }
-  const resp = await fetch('/api/key/set', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ key: key, base_url: baseUrlInput.value || 'https://api.openai.com/v1', model: modelInput.value || 'gpt-4o-mini' }),
-  });
-  const data = await resp.json();
-  if (data.ok) {
-    keyStatus.innerHTML = `<span style="color:var(--success)">✓ 已保存: ${data.masked}</span>`;
-    setTimeout(() => { settingsModal.hidden = true; }, 1000);
-  } else {
-    keyStatus.innerHTML = `<span style="color:var(--danger)">保存失败</span>`;
+  try {
+    const resp = await fetch('/api/key/set', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ key: key, base_url: baseUrlInput.value || 'https://api.openai.com/v1', model: modelInput.value || 'gpt-4o-mini' }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      keyStatus.innerHTML = `<span style="color:var(--success)">✓ 已保存: ${data.masked}</span>`;
+      setTimeout(() => { settingsModal.hidden = true; }, 1000);
+    } else {
+      keyStatus.innerHTML = `<span style="color:var(--danger)">保存失败: ${data.detail || '未知错误'}</span>`;
+    }
+  } catch (err) {
+    keyStatus.innerHTML = `<span style="color:var(--danger)">错误: ${err.message}</span>`;
   }
 });
 
