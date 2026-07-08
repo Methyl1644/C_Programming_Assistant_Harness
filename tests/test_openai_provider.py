@@ -36,7 +36,7 @@ def test_openai_llm_chat_returns_text_and_action():
     llm._client = type("FakeClient", (), {
         "chat": type("FakeCompletions", (), {
             "completions": type("FakeCreate", (), {
-                "create": lambda **kwargs: fake_response,
+                "create": lambda self, **kwargs: fake_response,
             })(),
         })(),
     })()
