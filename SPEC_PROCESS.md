@@ -152,45 +152,109 @@
 
 ---
 
-## 4. 冷启动验证记录（§4.5 必填，**待补**）
+## 4. 冷启动验证记录（§4.5）
 
-> 这部分在**冷启动 agent 跑完后**回填。结构如下：
+> 课程通用要求 §4.5："正式实现前，用一个与主开发智能体不同的 agent，
+> 在不向其提供你与主 agent 对话历史的前提下，仅凭 SPEC.md + PLAN.md
+> 尝试实现 1–2 个 task"。
+>
+> 本节记录**两次**冷启动：第一次"扩展式"（跑 6 task 出错）、第二次"补充式"（worktree 隔离、只测 Task 7）。
 
-### 4.1 冷启动 agent 元信息（待填）
+### 4.1 冷启动 agent 元信息
 
-- agent 名称：
-- 版本：
-- session 启动时间：
-- session 结束时间：
-- 测试 task 列表：
+| 项 | 第一次冷启动 | 第二次冷启动（补充）|
+|---|---|---|
+| **agent 类型** | Claude Code (deepseek-v4-pro) | Claude Code (deepseek-v4-pro) |
+| **与主 agent 关系** | 不同 ✓ | 不同 ✓ |
+| **session** | 全新 ✓ | 全新 ✓ |
+| **输入** | 仅 SPEC + PLAN | 仅 SPEC + PLAN（在 worktree 隔离目录里）|
+| **测的 task 数** | 6（违反 §4.5 "1-2"）| 1（Task 7，遵守 §4.5）|
+| **commit 数** | 7 | 3（红+绿+重构）|
+| **测试结果** | 37 passed / 6 skipped | 41 passed / 6 skipped |
+| **耗时** | ~ 2 小时 | ~ 15 分钟 |
+| **工作目录** | 主项目 `D:\Desktop\Homework\AI_agent\C_Programming_Assistant_Harness` | Worktree `D:\Desktop\Homework\AI_agent\_coldstart_task7` 分支 `_coldstart/task-7-rerun` |
 
-### 4.2 卡点清单（待填）
+### 4.2 卡点清单（按发现顺序）
 
-| # | 卡点位置 | 卡点内容 | 建议修改 | 已修复？ |
-|---|---------|---------|---------|---------|
-|   |         |         |         |         |
+> 两次冷启动共发现 **3 个 SPEC/PLAN 漏洞**：
 
-### 4.3 解读差异清单（待填）
+| # | 漏洞 | 来源 | 修复位置 | 状态 |
+|---|------|------|---------|------|
+| 1 | **pyproject.toml 缺 `dependencies` 字段** | 第一次冷启动 | T1.1 commit 4860b36 漏写 | ✅ 已在 commit 0ccd003 补全 |
+| 2 | **PLAN Task 7 Step 1 用 `try/except ImportError` 包裹 `from ... import WindowsSandbox`**——模块缺失时变成 `HAS_WIN32=False`，测试 skip 而非 FAIL。**违反 TDD 硬要求**（红阶段必须真红）| 第二次冷启动 | PLAN Task 7 Step 1 | ✅ 已修正：直接 import，让 RED 阶段产生 ImportError collection error；guard 后移到 REFACTOR |
+| 3 | **SPEC §5.3 vs PLAN Task 7 矛盾**——SPEC §5.3 写"Windows 用 `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP` + `job object` 限制"，但 PLAN Task 7 代码完全不含 `creationflags`。两文档对"初版是否含 creationflags"无一致说法 | 第二次冷启动 | SPEC §5.3 | ✅ 已修正：明确"初版（v0.1）不含 creationflags"，列 v0.2 路线 |
 
-| # | SPEC/PLAN 原文 | 冷启动 agent 的解读 | 与原意差异 | 是 spec 错还是 agent 读错 | 处理 |
-|---|---------------|------------------|----------|----------------------|------|
-|   |               |                  |          |                      |      |
+### 4.3 解读差异清单
 
-### 4.4 SPEC / PLAN 修订 diff（待填）
+> 第二次冷启动与主项目 Task 7（**实际上主项目当时未实现 Task 7**，所以对比改为"冷启动实现 vs PLAN 预设代码"）。
 
+| # | PLAN 预设写法 | 冷启动实现写法 | 哪个对？| 处理 |
+|---|-------------|--------------|-------|------|
+| 1 | RED 测试用 `try/except ImportError` 包裹 import → RED 阶段测试 skip 而非 fail | RED 测试直接 `from ... import WindowsSandbox`（无 guard）→ 产生 ImportError collection error（真红）| **冷启动对** | TDD 要求真红；PLAN 修正 |
+| 2 | 测试文件只列 2 个测试（echo + secret env）| 写了 4 个测试（echo + secret env + workspace chdir + nonzero exit）| **冷启动对** | 对标 POSIX 测试套件（Task 6 写了 6 个测试）覆盖度 |
+| 3 | PLAN 未提更新 `sandbox/__init__.py` | REFACTOR 阶段更新 `__init__.py` 导出 `WindowsSandbox` | **冷启动对** | 保持与其他 backend（PosixSandbox, InMemorySandbox）导出风格一致 |
+| 4 | `HAS_WIN32` 变量名（暗示检测 pywin32）| `WindowsSandbox = None` fallback 模式 | **冷启动对** | PLAN 变量名误导——实际检测的是模块是否存在，不是 pywin32 |
+
+### 4.4 SPEC / PLAN 修订 diff
+
+#### 修订 1：SPEC §5.3 资源限制
+
+```diff
+- - Windows: 用 subprocess 的 `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP`
+-   + `job object` 限制（`pywin32` 的 `win32job` 模块，或退回 `timeout`
+-   杀进程 + RSS 轮询）。**沙箱接口统一，但实现分平台**——通过
+-   `SandboxBackend` Protocol 抽象，单元测试用 in-memory backend。
++ - Windows: **初版（v0.1）**仅做 chdir + env cleanup + 10s timeout；job object
++   限制（`pywin32` 的 `win32job` 模块）和 `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP`
++   列入 v0.2 路线。Job objects 是 Windows 上 rlimit 的等价物——`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
++   确保子进程随父进程死亡。**沙箱接口统一，但实现分平台**——通过
++   `SandboxBackend` Protocol 抽象，单元测试用 in-memory backend。
++ - **初版不含 creationflags 的原因**：避免硬依赖 pywin32；v0.1 优先跑通 mock-driven 单测
++   路径，CPU/内存硬限制属于"防御深度"增强而非"安全屏障"必须项（网络/路径拦截才是）
 ```
-# 例：SPEC §5.3 L0 模式增加一条
-- 旧：...
-+ 新：...
-理由：...
+
+理由：消除 SPEC/PLAN 关于 creationflags 的矛盾；明确 v0.1 / v0.2 边界。
+
+#### 修订 2：PLAN Task 7 Step 1 测试设计
+
+```diff
+- try:
+-     from cpa_harness.guardrails.sandbox.windows import WindowsSandbox
+-     HAS_WIN32 = True
+- except ImportError:
+-     HAS_WIN32 = False
+-
+- @pytest.mark.skipif(not HAS_WIN32, reason="pywin32 not installed")
+- def test_echo_runs_on_windows(tmp_path): ...
+- @pytest.mark.skipif(not HAS_WIN32, reason="pywin32 not installed")
+- def test_secret_env_stripped_on_windows(tmp_path): ...
++ # 直接 import，无 try/except —— 缺失即真红（TDD 硬要求）
++ from cpa_harness.guardrails.sandbox.windows import WindowsSandbox
++
++ def test_echo_runs_on_windows(tmp_path): ...
++ def test_secret_env_stripped_on_windows(tmp_path): ...
++ def test_sandbox_runs_in_workspace(tmp_path): ...
++ def test_sandbox_captures_nonzero_exit(tmp_path): ...
 ```
 
-### 4.5 整体清晰度评价（待填）
+理由：TDD 硬要求"红"必须真红；4 个测试对齐 POSIX 覆盖度。
 
-- SPEC 清晰度：__/10
-- PLAN 清晰度：__/10
-- 课程硬要求覆盖度：__/10
-- 最值得改进的 1 件事：
+### 4.5 整体清晰度评价
+
+| 维度 | 第一次冷启动后 | 第二次冷启动后 |
+|------|---------------|---------------|
+| SPEC 清晰度 | 7/10 | **8/10**（修订 1 后）|
+| PLAN 清晰度 | 6/10 | **7/10**（修订 2 后）|
+| 冷启动 agent 整体表现 | 6/10（6 task 偏离协议）| **9/10**（严守 1 task 边界）|
+| 最严重的 SPEC 漏洞 | §5.3 creationflags 矛盾 | （已修复）|
+| 最严重的 PLAN 漏洞 | T1.1 缺 deps | Task 7 try/except 吞红（已修复）|
+
+### 4.6 给后续工作的启示
+
+1. **TDD 测试模板硬约束**：所有跨平台 task 的测试**禁止**用 `try/except ImportError` 吞红。已加进 `AGENTS.md §3.1`。
+2. **SPEC / PLAN 必须一致**：每写一个 task，im 应**逐行对齐** SPEC 的设计意图与 PLAN 的代码。如有冲突，先改文档再写代码。
+3. **冷启动 prompt 的硬边界**：第一次冷启动 prompt 缺边界导致 6 task 跑飞；第二次加 5 条硬约束后严守 1 task 边界——证明 prompt 模板对 agent 行为的影响**远大于** agent 本身的"判断力"。
+4. **worktree 隔离是冷启动的物理保障**：主分支的实现是"作弊线索"——即使 agent 自觉不读，存在就是污染源。worktree + 文件清理是**必要**的。
 
 ---
 
@@ -204,4 +268,4 @@
 ---
 
 > 本文件满足课程通用要求 §4.4 + §4.5 的硬性交付要求。
-> 冷启动部分（§4）必须由用户在另一个 agent 中完成后回填。
+> 冷启动部分（§4）已由两次冷启动 + 修订闭环填完。

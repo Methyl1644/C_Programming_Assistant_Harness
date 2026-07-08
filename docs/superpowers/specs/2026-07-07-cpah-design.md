@@ -210,10 +210,13 @@ Harness 内部分为 6 个模块，对应 A 文件 §A.1 的六个维度（决�
 - **环境清理**: 清空 `HOME`、`PATH`、所有 `*_TOKEN`、`*_KEY` 环境变量
 - **资源限制**:
   - Linux/macOS: `resource.setrlimit(RLIMIT_CPU, 5)`、`RLIMIT_AS = 256MB`
-  - Windows: 用 subprocess 的 `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP`
-    + `job object` 限制（`pywin32` 的 `win32job` 模块，或退回 `timeout`
-    杀进程 + RSS 轮询）。**沙箱接口统一，但实现分平台**——通过
+  - Windows: **初版（v0.1）**仅做 chdir + env cleanup + 10s timeout；job object
+    限制（`pywin32` 的 `win32job` 模块）和 `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP`
+    列入 v0.2 路线。Job objects 是 Windows 上 rlimit 的等价物——`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    确保子进程随父进程死亡。**沙箱接口统一，但实现分平台**——通过
     `SandboxBackend` Protocol 抽象，单元测试用 in-memory backend。
+  - **初版不含 creationflags 的原因**：避免硬依赖 pywin32；v0.1 优先跑通 mock-driven 单测
+    路径，CPU/内存硬限制属于"防御深度"增强而非"安全屏障"必须项（网络/路径拦截才是）
 - **网络**: 防火墙规则拒绝所有出站（Linux 用 `nft`/iptables；Windows 用
   `netsh`），子进程继承；或更简单——命令黑名单 + 解析 LLM 想跑什么
 - **单文件 vs 多文件**: `run_feedback(target)` 的 `target` 可以是单文件

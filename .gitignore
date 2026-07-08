@@ -26,6 +26,7 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+.claude/
 
 # Secrets and runtime artefacts (NEVER COMMIT)
 .env
