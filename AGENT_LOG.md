@@ -261,10 +261,66 @@ git push -u origin main       # 第一次 push
 | Writing Plans | 1 / 1 | 100% |
 | Git Push | 1 / 1 | 100% |
 | **SPEC_PROCESS.md**（§4.4 部分）| **1 / 1** | **100%** |
-| **冷启动验证**（§4.5 部分）| **0 / 1** | **0%** |
+| **冷启动验证**（§4.5 部分）| **1 / 1** | **100%** |
 | 实现 (Task 1-18) | 1 / 18 | 6% |
 | WebUI + Docker + 部署 + 反思 | 0 / 4 | 0% |
 | **总进度** | **12 / 37** | **32%** |
+
+---
+
+## 2026-07-08 · 阶段：补充冷启动 + 文档修订
+
+### 任务 T0.9：补充冷启动 Task 7 + 整合发现
+
+| 字段 | 值 |
+|------|---|
+| **时间** | 2026-07-08 下午 |
+| **task 编号** | T0.9 |
+| **触发的技能** | `subagent-driven-development`（worktree 模式）|
+| **关键 commit** | `6198c62`（docs 修订）+ `14646e6` / `25ff7ac` / `786b04f`（cherry-pick 3 个冷启动 commit）|
+| **新增文件** | `QUESTIONS.md`（Q&A 日志）|
+
+### 触发原因
+
+- 第一次冷启动（Claude Code）跑飞（6 task 而非 1-2），偏离 §4.5
+- 需要 worktree 隔离做"补充冷启动"——只测 Task 7
+- 冷启动报告回填到 SPEC_PROCESS §4，触发 SPEC/PLAN 修订
+
+### 关键决策
+
+1. **建 worktree `_coldstart/task-7-rerun`** 隔离冷启动工作区
+2. **删除所有实施文件 + 泄漏文件**（AGENT_LOG/RESUMING/AGENTS/SPEC_PROCESS/sessions/cold_review），只留 SPEC + PLAN + LICENSE + README + .gitignore
+3. **改良 cold-start prompt** 加 5 条硬边界（数量 / 暂停 / 写权限 / 继续信号 / 报告）
+4. **冷启动结果**：3 commit（红/绿/重构）、41 passed / 6 skipped、2 个真卡点
+5. **真卡点影响**：
+   - 卡点 a（PLAN try/except 吞红）→ 修正 PLAN Task 7 Step 1（直接 import，让 RED 真红）
+   - 卡点 b（SPEC §5.3 vs PLAN 矛盾）→ 修正 SPEC §5.3（明确 v0.1 不含 creationflags，列 v0.2 路线）
+6. **cherry-pick 冷启动 3 commit 进 main**——主项目 Task 7 实际上未实施，冷启动超前
+
+### 学到的教训
+
+- **L13（冷启动 prompt 是关键变量）**：第一次冷启动 prompt 留歧义 → 跑飞 6 task；第二次加 5 条硬边界 → 严守 1 task。**prompt 对 agent 行为的影响远大于 agent 本身的"判断力"**
+- **L14（worktree 是冷启动的物理保障）**：主分支的实施是"作弊线索"——即使 agent 自觉不读，存在就是污染源
+- **L15（test 模板是 TDD 流程的一部分）**：PLAN 写错测试模板（try/except 吞红）= TDD 流程结构性缺陷。所有跨平台 task 的测试**禁止**用 try/except ImportError 吞红
+
+### 进度（截至现在）
+
+| 阶段 | 完成 / 总数 | 百分比 |
+|------|-----------|--------|
+| Brainstorming | 8 / 8 | 100% |
+| Writing Plans | 1 / 1 | 100% |
+| Git Push | 1 / 1 | 100% |
+| SPEC_PROCESS.md | 1 / 1 | 100% |
+| 冷启动验证 | 1 / 1 | 100% |
+| 实现 (Task 1-18) | 7 / 18 | 39% |
+| 冷启动验证补全 | 1 / 1 | 100% |
+| WebUI + Docker + 部署 + 反思 | 0 / 4 | 0% |
+| **总进度** | **19 / 38** | **50%** |
+
+### 下一步
+
+推 Task 8（Tool Registry + 8 工具）
+
 
 
 

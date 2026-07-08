@@ -21,9 +21,9 @@
 | **时间** | 2026-07-08 |
 | **触发** | 冷启动 Task 7 报告完成，3 commit + 41 passed / 6 skipped + 2 个真卡点 |
 | **问题** | "继续吧" + 想要看 question list |
-| **用户答案** | 继续 + 要求看 question list（即本文件） |
-| **决策** | (1) 建 QUESTIONS.md；(2) 更新 SPEC_PROCESS §4 / PLAN Task 7 / SPEC §5.3；(3) cherry-pick 冷启动 3 commit；(4) 推 Task 8 |
-| **状态** | 进行中 |
+| **用户答案** | 继续 + 要求看 question list（即本文件）|
+| **决策** | (1) 建 QUESTIONS.md ✓；(2) 更新 SPEC_PROCESS §4 / PLAN Task 7 / SPEC §5.3 ✓（commit 6198c62）；(3) cherry-pick 冷启动 3 commit ✓（14646e6 / 25ff7ac / 786b04f）；(4) 推 Task 8 |
+| **状态** | 已完成（41 passed / 6 skipped, Task 7 cherry-pick 完成；待推 Task 8）|
 
 ### Q-06 · 怎么走？冷启动还是重跑？
 
