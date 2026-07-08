@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CP-AH · C Programming Assistant</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <header class="header">
+      <h1 class="logo">CP-AH</h1>
+      <span class="tagline">C 语言编程助手 · 护栏优先</span>
+    </header>
+
+    <!-- Main content -->
+    <main class="main">
+      <!-- Left: Upload + Goal -->
+      <section class="panel input-panel">
+        <h2>提交代码</h2>
+        <div class="upload-area" id="uploadArea">
+          <p>点击或拖拽 .c 文件到此处</p>
+          <input type="file" id="fileInput" accept=".c,.h" hidden>
+        </div>
+        <div class="file-info" id="fileInfo"></div>
+
+        <h2>你的问题</h2>
+        <textarea id="goalInput" placeholder="例如：这段代码哪里错了？" rows="3"></textarea>
+        <button class="btn btn-primary" id="askBtn" disabled>提交</button>
+      </section>
+
+      <!-- Right: Result -->
+      <section class="panel result-panel">
+        <h2>Agent 反馈</h2>
+        <div class="result-area" id="resultArea">
+          <p class="placeholder">提交代码和问题后，Agent 的反馈会显示在这里</p>
+        </div>
+      </section>
+    </main>
+
+    <!-- HITL Approval Modal -->
+    <div class="modal-overlay" id="hitlModal" hidden>
+      <div class="modal">
+        <h3>需要你的批准</h3>
+        <p class="modal-reason" id="hitlReason"></p>
+        <pre class="diff-view" id="diffView"></pre>
+        <div class="modal-actions">
+          <button class="btn btn-reject" id="rejectBtn">拒绝</button>
+          <button class="btn btn-edit" id="editBtn">编辑</button>
+          <button class="btn btn-approve" id="approveBtn">批准</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
