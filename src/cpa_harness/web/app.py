@@ -1,4 +1,5 @@
 """FastAPI app: serves static frontend + API endpoints + WebSocket HITL."""
+import sys
 import uuid
 from pathlib import Path
 
@@ -9,13 +10,18 @@ from pydantic import BaseModel
 
 from cpa_harness.action import Action
 from cpa_harness.llm.mock import MockLLM, MockTurn
+from cpa_harness.llm.openai_provider import OpenAILLM
+from cpa_harness.llm.provider import LLMProvider
 from cpa_harness.tools.registry import ToolRegistry
 from cpa_harness.tools import (
     read_file, list_dir, search_code, write_file,
     exec_command, take_note, finish_tutoring, run_feedback,
 )
 from cpa_harness.guardrails.sandbox.in_memory import InMemorySandbox
+from cpa_harness.guardrails.sandbox.posix import PosixSandbox
+from cpa_harness.guardrails.sandbox.windows import WindowsSandbox
 from cpa_harness.loop import AgentLoop
+from cpa_harness.credentials import get_api_key
 
 app = FastAPI(title="CP-AH", description="C Programming Assistant Harness")
 
@@ -26,6 +32,19 @@ _WORKSPACES_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 _sessions: dict[str, dict] = {}
+
+
+def _build_sandbox(workspace: str):
+    """Use a real sandbox so gcc/valgrind actually run."""
+    if sys.platform == "win32":
+        try:
+            return WindowsSandbox(workspace=workspace)
+        except Exception:
+            pass
+    try:
+        return PosixSandbox(workspace=workspace)
+    except Exception:
+        return InMemorySandbox()
 
 
 def _build_registry() -> ToolRegistry:
@@ -46,6 +65,35 @@ def _build_registry() -> ToolRegistry:
     return reg
 
 
+def _build_llm(goal: str, filename: str) -> tuple[LLMProvider, bool]:
+    """Build LLM: real if API key exists, mock otherwise.
+
+    Returns (llm, is_mock).
+    """
+    api_key = get_api_key()
+    if api_key:
+        return OpenAILLM(api_key=api_key, model="gpt-4o-mini"), False
+
+    # Mock: at least run real compile feedback so user gets something useful
+    mock = MockLLM(script=[
+        MockTurn(
+            text=f"我来读一下 {filename}",
+            action=Action(type="call_tool", tool="read_file",
+                          args={"path": filename}),
+        ),
+        MockTurn(
+            text=f"让我编译并测试 {filename}",
+            action=Action(type="call_tool", tool="run_feedback",
+                          args={"target": filename}),
+        ),
+        MockTurn(
+            text="分析完成。以上是编译和内存检查的反馈。",
+            action=Action(type="done"),
+        ),
+    ])
+    return mock, True
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     index_path = _STATIC_DIR / "index.html"
@@ -56,7 +104,6 @@ async def index():
 
 @app.post("/api/upload")
 async def upload_file(file: bytes = b""):
-    import tempfile
     session_id = uuid.uuid4().hex[:12]
     workspace = _WORKSPACES_DIR / session_id
     workspace.mkdir(parents=True, exist_ok=True)
@@ -82,18 +129,13 @@ async def ask(req: AskRequest):
     workspace = sess["workspace"]
     filename = sess["filename"]
 
-    mock = MockLLM(script=[
-        MockTurn(
-            text=f"I will read {filename}",
-            action=Action(type="call_tool", tool="read_file",
-                          args={"path": filename}),
-        ),
-        MockTurn(text="Done", action=Action(type="done")),
-    ])
+    llm, is_mock = _build_llm(req.goal, filename)
+    sandbox = _build_sandbox(workspace)
+
     loop = AgentLoop(
-        llm=mock,
+        llm=llm,
         tools=_build_registry(),
-        sandbox=InMemorySandbox(),
+        sandbox=sandbox,
         goal=req.goal,
         workspace=workspace,
         max_steps=10,
@@ -104,6 +146,7 @@ async def ask(req: AskRequest):
         "steps": result.steps,
         "exit_reason": result.exit_reason,
         "history": loop.history,
+        "is_mock": is_mock,
     }
 
 

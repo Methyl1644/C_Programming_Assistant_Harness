@@ -147,6 +147,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
   justify-content: center;
   z-index: 100;
 }
+.modal-overlay[hidden] { display: none; }
 .modal {
   background: var(--surface);
   border: 1px solid var(--border);

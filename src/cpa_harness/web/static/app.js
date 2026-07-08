@@ -69,6 +69,14 @@ askBtn.addEventListener('click', async () => {
 function displayResult(data) {
   let html = '';
 
+  // Mock warning
+  if (data.is_mock) {
+    html += `<div class="result-step" style="border-left-color: var(--warning)">
+      <div class="role" style="color: var(--warning)">⚠ Mock 模式</div>
+      <div class="content">未配置 API key，使用 MockLLM。Agent 会读文件 + 跑编译反馈，但不会用 LLM 分析代码。运行 <code>cpa-harness setup</code> 配置 key 后可获得真 LLM 分析。</div>
+    </div>`;
+  }
+
   // History steps
   if (data.history && data.history.length > 0) {
     for (const step of data.history) {
@@ -80,8 +88,9 @@ function displayResult(data) {
         content = step.observation;
         if (content.includes('BLOCKED')) blocked = true;
       }
+      const roleLabel = role === 'assistant' ? '🤖 Agent' : '📋 工具结果';
       html += `<div class="result-step${blocked ? ' result-blocked' : ''}">
-        <div class="role">${role}</div>
+        <div class="role">${roleLabel}</div>
         <div class="content">${escapeHtml(content)}</div>
       </div>`;
     }
