@@ -30,12 +30,13 @@
 | SPEC §11 测试策略（TDD / MockLLM / 一键测试） | ✅ | 71477d3 |
 | SPEC §12-§14 风险 / 凭据威胁 / 反思 | ✅ | 0f15461 |
 | **SPEC 自检与用户复审** | ✅ | — |
-| writing-plans（拆成 subagent 任务） | ⏸ | — |
-| 代码实现 (TDD: 红→绿→重构) | ⏸ | — |
-| 冷启动验证（用别的 agent 试跑 1-2 task） | ⏸ | — |
-| SPEC_PROCESS.md / AGENT_LOG.md / REFLECTION.md | ⏸ | — |
-| Docker + PyPI 分发 | ⏸ | — |
-| CI (`.gitlab-ci.yml` 含 `unit-test` job) | ⏸ | — |
+| writing-plans（拆成 subagent 任务） | ✅ | 6665997 |
+| 代码实现 (TDD: 红→绿→重构, Task 1-18) | ✅ | 81 passed / 7 skipped |
+| 冷启动验证（两次, 3 个文档漏洞已修订） | ✅ | 6198c62 |
+| SPEC_PROCESS.md / AGENT_LOG.md / REFLECTION.md | ✅ | 4628090 |
+| WebUI (FastAPI + Linear 前端) | ✅ | 5381d2b |
+| Docker 分发 (Dockerfile + .dockerignore) | ✅ | 9997925 |
+| CI (`.gitlab-ci.yml` 含 `unit-test` job) | ✅ | (已有) |
 | 云部署 + 公网 URL | ⏸ | — |
 
 ---
