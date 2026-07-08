@@ -7,7 +7,10 @@ pytestmark = pytest.mark.skipif(
     reason="Windows-only test",
 )
 
-from cpa_harness.guardrails.sandbox.windows import WindowsSandbox
+try:
+    from cpa_harness.guardrails.sandbox import WindowsSandbox
+except ImportError:
+    WindowsSandbox = None  # type: ignore[assignment]
 
 
 def test_echo_runs_on_windows(tmp_path):
