@@ -1,0 +1,10 @@
+.git
+__pycache__
+*.pyc
+.pytest_cache
+tests/
+docs/
+workspaces/
+.env
+.keyring.json
+.claude/

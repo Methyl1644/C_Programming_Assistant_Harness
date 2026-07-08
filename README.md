@@ -20,9 +20,32 @@ CP-AH 用**护栏优先**的 harness 解决这两点。
 
 ## Status
 
-🚧 In design. SPEC is being written.
+✅ Core complete — 81 tests passing, WebUI live, Docker image builds.
 
 See [`docs/superpowers/specs/`](docs/superpowers/specs/) for the design doc.
+
+## Quick Start
+
+### Docker (recommended)
+
+```bash
+docker build -t cpa-harness .
+docker run -p 8000:8000 cpa-harness
+# open http://localhost:8000
+```
+
+### Local dev
+
+```bash
+pip install -e ".[dev]"
+uvicorn cpa_harness.web.app:app --reload
+```
+
+### Run tests
+
+```bash
+pytest
+```
 
 ## Project Structure (planned)
 
