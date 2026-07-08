@@ -107,6 +107,8 @@ textarea:focus { outline: none; border-color: var(--accent); }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .btn-primary { background: var(--accent); color: white; margin-top: 12px; }
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+.btn-secondary { background: var(--surface-hover); color: var(--text); border: 1px solid var(--border); }
+.btn-secondary:hover { background: var(--border); }
 .btn-approve { background: var(--success); color: white; }
 .btn-reject { background: var(--danger); color: white; }
 .btn-edit { background: var(--warning); color: var(--bg); }

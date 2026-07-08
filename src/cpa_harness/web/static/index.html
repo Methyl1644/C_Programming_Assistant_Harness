@@ -12,6 +12,7 @@
     <header class="header">
       <h1 class="logo">CP-AH</h1>
       <span class="tagline">C 语言编程助手 · 护栏优先</span>
+      <button class="btn btn-secondary" id="settingsBtn" style="margin-left:auto">设置</button>
     </header>
 
     <!-- Main content -->
@@ -49,6 +50,22 @@
           <button class="btn btn-reject" id="rejectBtn">拒绝</button>
           <button class="btn btn-edit" id="editBtn">编辑</button>
           <button class="btn btn-approve" id="approveBtn">批准</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal-overlay" id="settingsModal" hidden>
+      <div class="modal">
+        <h3>API Key 设置</h3>
+        <p style="color:var(--text-dim);margin-bottom:12px">配置 OpenAI 兼容的 API key（OpenAI / DeepSeek / 硅基流动等）。Key 存储在系统钥匙串中，不会明文保存。</p>
+        <div id="keyStatus" style="margin-bottom:12px"></div>
+        <input type="password" id="keyInput" placeholder="sk-..." style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px;color:var(--text);font-family:var(--mono);font-size:13px;margin-bottom:8px">
+        <input type="text" id="baseUrlInput" placeholder="Base URL (默认: https://api.openai.com/v1)" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px;color:var(--text);font-size:13px;margin-bottom:8px">
+        <input type="text" id="modelInput" placeholder="模型 (默认: gpt-4o-mini)" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px;color:var(--text);font-size:13px;margin-bottom:16px">
+        <div class="modal-actions">
+          <button class="btn btn-reject" id="clearKeyBtn">清除</button>
+          <button class="btn btn-primary" id="saveKeyBtn">保存</button>
         </div>
       </div>
     </div>

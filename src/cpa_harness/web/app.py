@@ -21,7 +21,7 @@ from cpa_harness.guardrails.sandbox.in_memory import InMemorySandbox
 from cpa_harness.guardrails.sandbox.posix import PosixSandbox
 from cpa_harness.guardrails.sandbox.windows import WindowsSandbox
 from cpa_harness.loop import AgentLoop
-from cpa_harness.credentials import get_api_key
+from cpa_harness.credentials import get_api_key, store_api_key, clear_api_key, mask_key
 
 app = FastAPI(title="CP-AH", description="C Programming Assistant Harness")
 
@@ -119,6 +119,34 @@ async def upload_file(file: bytes = b""):
 class AskRequest(BaseModel):
     session_id: str
     goal: str = "explain this code"
+
+
+class KeyRequest(BaseModel):
+    key: str
+    base_url: str = "https://api.openai.com/v1"
+    model: str = "gpt-4o-mini"
+
+
+@app.get("/api/key/status")
+async def key_status():
+    key = get_api_key()
+    if key:
+        return {"configured": True, "masked": mask_key(key)}
+    return {"configured": False, "masked": "(empty)"}
+
+
+@app.post("/api/key/set")
+async def key_set(req: KeyRequest):
+    if not req.key.strip():
+        raise HTTPException(status_code=400, detail="empty key")
+    store_api_key(req.key.strip())
+    return {"ok": True, "masked": mask_key(req.key.strip())}
+
+
+@app.post("/api/key/clear")
+async def key_clear():
+    clear_api_key()
+    return {"ok": True}
 
 
 @app.post("/api/ask")

@@ -136,3 +136,51 @@ document.getElementById('rejectBtn').addEventListener('click', () => {
 document.getElementById('editBtn').addEventListener('click', () => {
   // TODO: open edit mode
 });
+
+// Settings modal
+const settingsBtn = document.getElementById('settingsBtn');
+const settingsModal = document.getElementById('settingsModal');
+const keyStatus = document.getElementById('keyStatus');
+const keyInput = document.getElementById('keyInput');
+const baseUrlInput = document.getElementById('baseUrlInput');
+const modelInput = document.getElementById('modelInput');
+
+settingsBtn.addEventListener('click', async () => {
+  settingsModal.hidden = false;
+  keyInput.value = '';
+  baseUrlInput.value = '';
+  modelInput.value = '';
+  const resp = await fetch('/api/key/status');
+  const data = await resp.json();
+  if (data.configured) {
+    keyStatus.innerHTML = `<span style="color:var(--success)">✓ 已配置: ${data.masked}</span>`;
+  } else {
+    keyStatus.innerHTML = '<span style="color:var(--warning)">⚠ 未配置（将使用 Mock 模式）</span>';
+  }
+});
+
+document.getElementById('saveKeyBtn').addEventListener('click', async () => {
+  const key = keyInput.value.trim();
+  if (!key) { keyStatus.innerHTML = '<span style="color:var(--danger)">请输入 key</span>'; return; }
+  const resp = await fetch('/api/key/set', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ key: key, base_url: baseUrlInput.value || 'https://api.openai.com/v1', model: modelInput.value || 'gpt-4o-mini' }),
+  });
+  const data = await resp.json();
+  if (data.ok) {
+    keyStatus.innerHTML = `<span style="color:var(--success)">✓ 已保存: ${data.masked}</span>`;
+    setTimeout(() => { settingsModal.hidden = true; }, 1000);
+  } else {
+    keyStatus.innerHTML = `<span style="color:var(--danger)">保存失败</span>`;
+  }
+});
+
+document.getElementById('clearKeyBtn').addEventListener('click', async () => {
+  const resp = await fetch('/api/key/clear', { method: 'POST' });
+  const data = await resp.json();
+  if (data.ok) {
+    keyStatus.innerHTML = '<span style="color:var(--text-dim)">已清除</span>';
+    keyInput.value = '';
+  }
+});
