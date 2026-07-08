@@ -44,14 +44,75 @@
 - **教训 L4（用户）**：用户是大一学生，**概念解释要具体、避免
   抽象**；技术决策要给"为什么" + 替代选项。
 
-### 下一步
+---
 
-- 进入 writing-plans 技能，把 SPEC 拆成可由 subagent 完成的 task
-  列表
-- 第一个 task：建 `Makefile` + 项目骨架（`pyproject.toml` /
-  `src/cpa_harness/__init__.py`）
-- 第二个 task：实现 `LLMProvider` Protocol + `MockLLM`（TDD）
+## 2026-07-07 · 阶段：writing-plans
 
-### 偏离 Superpowers 工作流的地方
+### 任务 0.5：PLAN 起草
 
-无。所有阶段按 `brainstorming` 技能要求推进。
+| 字段 | 值 |
+|------|---|
+| **时间** | 2026-07-07 傍晚 |
+| **task 编号** | T0.5 |
+| **触发的 Superpowers 技能** | `writing-plans` |
+| **关键 commit** | `67f3e2c` |
+| **产出** | `docs/superpowers/plans/2026-07-07-cpah-plan.md` |
+
+### 关键决策
+
+1. **18 个 task**，每个独立 TDD 循环（红 / 绿 / 重构）
+2. **三个 subagent-driven tasks 不在 plan 里**：冷启动验证、SPEC_PROCESS.md、REFLECTION.md、finishing-a-development-branch——这些在实施阶段产生
+3. **主角维度深度**：Task 4（分类器）、Task 5（HITL）、Task 6/7（沙箱）、Task 13（loop 集成）— 共 4 个 task 服务于治理
+4. **self-review 发现的 5 个缺口**：WA/TLE/RE 解析、WebUI、Dockerfile、tracer、WebUI↔HITL 集成 — 列为 follow-up PR
+
+### 进度（截至 18:00）
+
+| 阶段 | 完成 / 总数 |
+|------|-----------|
+| Brainstorming | 8 / 8 ✅ |
+| Writing Plans | 1 / 1 ✅ |
+| 实现 | 0 / 18 ⏳ |
+| 验证 + 文档 + 部署 + 反思 | 0 / 8 ⏳ |
+| **总进度** | **9 / 35** |
+
+### 下一步（用户视角）
+
+1. 用户开加速器跑 `git push -u origin main`，把 8 个 commit 推到 GitHub
+2. AI 在 GitHub 上建 issue 看板（Task 1-3 / Task 4-7 主角维度 / Task 19 WebUI）
+3. 改天新会话：新 AI 读 AGENTS.md + SPEC + PLAN + git log，直接进 subagent-driven-development 跑 Task 1
+4. 每个 task 完成后：commit + 开 PR + 用户开加速器 push
+
+### 学到的教训
+
+- **教训 L5（plan 写作）**：分块写入比单次 write 大文件更稳——上次单次写入 100KB 文件触发 JSON 错误。改用 `edit` 追加 + 验证行数
+- **教训 L6（spec 与 plan 的关系）**：spec 描述"做什么 + 为什么"，plan 描述"怎么做 + 步骤"；spec 14 章 vs plan 18 task 是合理映射
+
+---
+
+## 2026-07-07 · 阶段：git push 准备
+
+### 任务 0.6：本地 commit 与 push 准备
+
+| 字段 | 值 |
+|------|---|
+| **时间** | 2026-07-07 18:00 |
+| **task 编号** | T0.6 |
+| **关键 commit** | 已有 8 个 commit (e696127 → 67f3e2c) |
+| **下一步** | 用户开加速器后 push |
+
+### push 手册（给用户）
+
+```powershell
+cd D:\Desktop\Homework\AI_agent\C_Programming_Assistant_Harness
+git status                    # 应是 "nothing to commit"
+git log --oneline             # 8 个 commit
+git push -u origin main       # 第一次 push
+```
+
+### push 之后
+
+- 打开 https://github.com/Methyl1644/C_Programming_Assistant_Harness
+- 验证 8 个 commit + 文件结构
+- 告诉 AI push 状态，AI 帮你建 issue 看板
+
+
