@@ -37,7 +37,7 @@
 | WebUI (FastAPI + Linear 前端) | ✅ | 5381d2b |
 | Docker 分发 (Dockerfile + .dockerignore) | ✅ | 9997925 |
 | CI (`.gitlab-ci.yml` 含 `unit-test` job) | ✅ | (已有) |
-| 云部署 + 公网 URL | ⏸ | — |
+| 云部署 + 公网 URL | N/A（本地 Docker 部署） | — |
 
 ---
 
