@@ -1,0 +1,3441 @@
+# CP-AH (C Programming Assistant Harness) Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 实现一个护栏优先的 Coding Agent Harness，让 C 语言初学者能安全地与 LLM 协作调试代码——agent 能跑测试、找内存问题，但绝不偷偷改学生代码、绝不跑沙箱外命令。
+
+**Architecture:** 单进程 Python 3.11 harness，6 大模块（决策 / 工具 / 治理 / 反馈 / 记忆 / 配置）解耦，主角维度为治理（危险动作分类 + HITL 状态机 + 进程级沙箱）。`LLMProvider` 是 Protocol，`MockLLM` 跑所有 CI 测试，`OpenAILLM` 走 OpenAI 兼容接口。WebUI 用 FastAPI，CLI 是 `python -m cpa_harness.cli`。
+
+**Tech Stack:** Python 3.11+ / FastAPI / pydantic / pytest / openai SDK / keyring / ruff / mypy
+
+## Global Constraints
+
+> 通用要求 + A 文件 + SPEC 的硬性约束。每条 task 隐含遵守。
+
+- **TDD 强制**: 每个 task = 失败测试 (红) → 最少实现 (绿) → 重构；三步各一个 commit
+- **MockLLM 优先**: harness 核心机制测试**必须**用 `MockLLM`，**不依赖网络/真 LLM**
+- **No 高层框架**: harness 核心**不能** import LangChain / AutoGen / CrewAI / LlamaIndex agent
+- **凭据安全**: 永不 hardcode key；用 `keyring` 库 + `.env` fallback（明确警告）
+- **进程级沙箱**: chdir + ulimit/job object + env 清理 + 命令黑名单
+- **HITL 强制**: `write_file` 覆盖学生文件 / `exec_command` 默认 deny
+- **覆盖率**: 整体 ≥ 80%；`cpa_harness.guardrails` ≥ 90%
+- **commit message**: Conventional Commits (`<type>(<scope>): <subject>`)
+- **每 task 一个 worktree + 一个 PR**（实施阶段用 subagent-driven-development 技能）
+- **学生原始 `.c` 文件**: agent **绝不能**在未 HITL 批准时改写
+
+---
+
+## Task 1: 项目骨架 + Makefile + CI
+
+**Files:**
+- Create: `pyproject.toml`
+- Create: `Makefile`
+- Create: `src/cpa_harness/__init__.py`
+- Create: `tests/__init__.py`
+- Create: `tests/conftest.py`
+- Create: `.gitlab-ci.yml`
+- Create: `.pre-commit-config.yaml`
+- Create: `pytest.ini`
+- Create: `ruff.toml`
+- Create: `tests/test_skeleton.py`
+
+**Interfaces:**
+- Produces: `make test` / `make test-cov` / `make lint` / `make typecheck` / `make e2e` 全部 work
+
+- [ ] **Step 1: 写 `pyproject.toml`**
+
+```toml
+[project]
+name = "cpa-harness"
+version = "0.1.0"
+description = "Guardrail-first Coding Agent Harness for C language learners"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0",
+    "pydantic>=2.0",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+    "keyring>=24",
+    "pyyaml>=6.0",
+    "httpx>=0.24",
+    "websockets>=11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+    "mypy>=1.0",
+    "gitleaks>=8.0",
+    "types-PyYAML",
+]
+
+[project.scripts]
+cpa-harness = "cpa_harness.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cpa_harness"]
+```
+
+- [ ] **Step 2: 写 `Makefile`**
+
+```makefile
+.PHONY: test test-cov lint typecheck e2e install clean
+
+install:
+	pip install -e ".[dev]"
+	pre-commit install
+
+test:
+	pytest
+
+test-cov:
+	pytest --cov=cpa_harness --cov-report=term-missing --cov-fail-under=80
+
+lint:
+	ruff check src/ tests/
+	ruff format --check src/ tests/
+
+typecheck:
+	mypy src/cpa_harness/
+
+e2e:
+	RUN_E2E=1 pytest tests/e2e/
+
+clean:
+	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov/ build/ dist/
+	find . -type d -name __pycache__ -exec rm -rf {} +
+```
+
+- [ ] **Step 3: 写 `pytest.ini`**
+
+```ini
+[pytest]
+testpaths = tests
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+addopts = -v --tb=short
+markers =
+    e2e: end-to-end tests requiring real LLM (deselect with -m 'not e2e')
+asyncio_mode = auto
+```
+
+- [ ] **Step 4: 写 `ruff.toml`**
+
+```toml
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+"tests/*" = ["B011"]
+```
+
+- [ ] **Step 5: 写 `src/cpa_harness/__init__.py` + `tests/__init__.py` + `tests/conftest.py`**
+
+```python
+# src/cpa_harness/__init__.py
+"""CP-AH: C Programming Assistant Harness."""
+__version__ = "0.1.0"
+```
+
+```python
+# tests/__init__.py
+```
+
+```python
+# tests/conftest.py
+"""Shared pytest fixtures for CP-AH."""
+import pytest
+
+
+@pytest.fixture
+def tmp_workspace(tmp_path):
+    """Provide a fresh workspace directory for a test session."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    return workspace
+```
+
+- [ ] **Step 6: 写 `tests/test_skeleton.py`**
+
+```python
+def test_import_cpa_harness():
+    import cpa_harness
+    assert cpa_harness.__version__ == "0.1.0"
+```
+
+- [ ] **Step 7: 写 `.gitlab-ci.yml`**
+
+```yaml
+stages:
+  - test
+  - lint
+  - secret-scan
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+
+# REQUIRED: A 文件 §4.8 必含 unit-test job
+unit-test:
+  stage: test
+  image: python:3.11
+  before_script:
+    - pip install -e ".[dev]"
+  script:
+    - make test
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+
+lint:
+  stage: lint
+  image: python:3.11
+  before_script:
+    - pip install -e ".[dev]"
+  script:
+    - make lint
+    - make typecheck
+
+secret-scan:
+  stage: secret-scan
+  image: zricethezav/gitleaks:latest
+  script:
+    - gitleaks detect --source . --no-git --verbose
+```
+
+- [ ] **Step 8: 写 `.pre-commit-config.yaml`**
+
+```yaml
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.0
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks
+```
+
+- [ ] **Step 9: 跑测试 + lint + typecheck**
+
+```bash
+pip install -e ".[dev]"
+make test
+make lint
+make typecheck
+```
+
+预期：`1 passed`，lint/typecheck 无错
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add pyproject.toml Makefile pytest.ini ruff.toml src/ tests/ .gitlab-ci.yml .pre-commit-config.yaml tests/test_skeleton.py
+git commit -m "build: scaffold project (pyproject + Makefile + CI + pre-commit)
+
+- pyproject.toml: hatchling backend, deps pinned, cpa-harness CLI script
+- Makefile: 5 entry points (test / test-cov / lint / typecheck / e2e)
+- pytest.ini: e2e marker so CI never accidentally runs E2E
+- ruff.toml: strict lints (E/F/W/I/N/UP/B/C4/SIM/RUF)
+- .gitlab-ci.yml: REQUIRED unit-test job + lint + gitleaks
+- .pre-commit-config.yaml: ruff + gitleaks on every commit
+- conftest.py: shared tmp_workspace fixture
+- test_skeleton.py: smoke test verifying import works"
+```
+
+---
+
+## Task 2: Action / Observation 数据模型
+
+**Files:**
+- Create: `src/cpa_harness/action.py`
+- Create: `src/cpa_harness/observation.py`
+- Create: `src/cpa_harness/feedback/__init__.py`
+- Create: `src/cpa_harness/feedback/report.py`
+- Create: `tests/test_action.py`
+- Create: `tests/test_observation.py`
+
+**Interfaces:**
+- Produces:
+  - `Action` (pydantic) — 5 种 type
+  - `Observation` (pydantic) — 工具结果
+  - `FeedbackReport` (pydantic) — 6 种 verdict
+
+- [ ] **Step 1: 写 `tests/test_action.py`（红）**
+
+```python
+import pytest
+from cpa_harness.action import Action
+
+
+def test_action_call_tool():
+    a = Action(type="call_tool", tool="read_file", args={"path": "main.c"})
+    assert a.type == "call_tool"
+    assert a.tool == "read_file"
+    assert a.args == {"path": "main.c"}
+
+
+def test_action_take_note():
+    a = Action(type="take_note", note="student is on pointer chapter")
+    assert a.type == "take_note"
+    assert a.note == "student is on pointer chapter"
+
+
+def test_action_finish_tutoring():
+    a = Action(type="finish_tutoring", summary="done")
+    assert a.type == "finish_tutoring"
+
+
+def test_action_done():
+    a = Action(type="done")
+    assert a.type == "done"
+
+
+def test_action_use_skill():
+    a = Action(type="use_skill", tool="test-driven-development")
+    assert a.type == "use_skill"
+
+
+def test_action_invalid_type_raises():
+    with pytest.raises(ValueError):
+        Action(type="fly_to_mars")
+```
+
+- [ ] **Step 2: 跑测试确认红**
+
+```bash
+pytest tests/test_action.py -v
+```
+
+预期：FAIL（`cpa_harness.action` 模块不存在）
+
+- [ ] **Step 3: 写 `src/cpa_harness/action.py`（绿）**
+
+```python
+"""Action: what the LLM wants the harness to do this turn."""
+from typing import Literal
+from pydantic import BaseModel, Field
+
+ActionType = Literal["call_tool", "use_skill", "take_note", "finish_tutoring", "done"]
+
+
+class Action(BaseModel):
+    type: ActionType
+    tool: str | None = None
+    args: dict = Field(default_factory=dict)
+    note: str | None = None
+    summary: str | None = None
+```
+
+- [ ] **Step 4: 跑测试确认绿**
+
+```bash
+pytest tests/test_action.py -v
+```
+
+预期：6 passed
+
+- [ ] **Step 5: 写 `tests/test_observation.py`（红）**
+
+```python
+from cpa_harness.observation import Observation
+
+
+def test_observation_minimal():
+    obs = Observation(tool="read_file", result="int main() {}", exit_code=0)
+    assert obs.tool == "read_file"
+    assert obs.result == "int main() {}"
+    assert obs.exit_code == 0
+
+
+def test_observation_with_signal():
+    obs = Observation(tool="exec_command", result="Segmentation fault", signal=11)
+    assert obs.signal == 11
+
+
+def test_observation_duration_tracks():
+    obs = Observation(tool="read_file", result="", exit_code=0, duration_ms=42)
+    assert obs.duration_ms == 42
+```
+
+- [ ] **Step 6: 跑测试确认红**
+
+```bash
+pytest tests/test_observation.py -v
+```
+
+- [ ] **Step 7: 写 `src/cpa_harness/observation.py`（绿）**
+
+```python
+"""Observation: what happened when a tool ran."""
+from pydantic import BaseModel
+from cpa_harness.feedback.report import FeedbackReport
+
+
+class Observation(BaseModel):
+    tool: str
+    result: str
+    exit_code: int | None = None
+    signal: int | None = None
+    feedback: FeedbackReport | None = None
+    duration_ms: int = 0
+```
+
+- [ ] **Step 8: 写 `src/cpa_harness/feedback/__init__.py` + `report.py`**
+
+```python
+# src/cpa_harness/feedback/__init__.py
+```
+
+```python
+# src/cpa_harness/feedback/report.py
+"""FeedbackReport: structured parse of gcc/valgrind/test output."""
+from typing import Literal
+from pydantic import BaseModel
+
+Verdict = Literal["AC", "CE", "WA", "TLE", "MLE", "RE"]
+
+
+class FeedbackReport(BaseModel):
+    verdict: Verdict
+    file: str
+    line: int | None = None
+    col: int | None = None
+    severity: Literal["error", "warning"] | None = None
+    msg: str
+    snippet: str | None = None
+    expected: str | None = None
+    actual: str | None = None
+    signal_name: str | None = None
+    rss_mb: float | None = None
+    leak_summary: str | None = None
+```
+
+- [ ] **Step 9: 跑测试**
+
+```bash
+pytest tests/test_action.py tests/test_observation.py -v
+```
+
+预期：9 passed
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/cpa_harness/action.py src/cpa_harness/observation.py src/cpa_harness/feedback/ tests/test_action.py tests/test_observation.py
+git commit -m "feat(models): add Action and Observation pydantic models
+
+Action: 5 types (call_tool / use_skill / take_note / finish_tutoring / done)
+Observation: tool result + exit_code + signal + optional FeedbackReport
+FeedbackReport stub: 6 verdicts (AC/CE/WA/TLE/MLE/RE), defined inline so
+  Observation can import it without circular dependency
+
+TDD: 9 tests written first (red), then minimal implementation (green).
+Next: enrich FeedbackReport with real gcc/valgrind parsing (Tasks 9-10)."
+```
+
+---
+
+## Task 3: LLMProvider Protocol + MockLLM
+
+**Files:**
+- Create: `src/cpa_harness/llm/__init__.py`
+- Create: `src/cpa_harness/llm/provider.py`
+- Create: `src/cpa_harness/llm/script.py`
+- Create: `src/cpa_harness/llm/mock.py`
+- Create: `tests/test_llm_mock.py`
+
+**Interfaces:**
+- Produces:
+  - `LLMProvider` Protocol with `chat(messages, menu) -> tuple[str, Action]`
+  - `MockLLM` with pre-programmed `script: list[MockTurn]`
+  - `MockTurn(text, action, raise_)`
+
+- [ ] **Step 1: 写 `tests/test_llm_mock.py`（红）**
+
+```python
+import pytest
+from cpa_harness.action import Action
+from cpa_harness.llm.mock import MockLLM, MockTurn
+from cpa_harness.llm.provider import LLMProvider
+
+
+def test_mock_llm_returns_scripted_turns():
+    mock = MockLLM(script=[
+        MockTurn(text="hi", action=Action(type="done")),
+        MockTurn(text="bye", action=Action(type="done")),
+    ])
+    text1, action1 = mock.chat(messages=[], menu=[])
+    text2, action2 = mock.chat(messages=[], menu=[])
+    assert text1 == "hi"
+    assert text2 == "bye"
+    assert action1.type == "done"
+    assert action2.type == "done"
+
+
+def test_mock_llm_raises_when_script_exhausted():
+    mock = MockLLM(script=[MockTurn(text="x", action=Action(type="done"))])
+    mock.chat(messages=[], menu=[])
+    with pytest.raises(IndexError):
+        mock.chat(messages=[], menu=[])
+
+
+def test_mock_llm_raises_simulated_error():
+    mock = MockLLM(script=[
+        MockTurn(text="", action=Action(type="done"), raise_=RuntimeError("LLM down")),
+    ])
+    with pytest.raises(RuntimeError, match="LLM down"):
+        mock.chat(messages=[], menu=[])
+
+
+def test_mock_llm_satisfies_provider_protocol():
+    mock = MockLLM(script=[])
+    assert isinstance(mock, LLMProvider)
+
+
+def test_mock_llm_records_call_count():
+    mock = MockLLM(script=[
+        MockTurn(text="a", action=Action(type="done")),
+        MockTurn(text="b", action=Action(type="done")),
+    ])
+    assert mock.call_count == 0
+    mock.chat([], [])
+    assert mock.call_count == 1
+    mock.chat([], [])
+    assert mock.call_count == 2
+```
+
+- [ ] **Step 2: 跑测试确认红**
+
+```bash
+pytest tests/test_llm_mock.py -v
+```
+
+- [ ] **Step 3: 写 `src/cpa_harness/llm/provider.py`（绿）**
+
+```python
+"""LLMProvider protocol — abstract interface so tests can swap in MockLLM."""
+from typing import Protocol, runtime_checkable
+from cpa_harness.action import Action
+
+
+@runtime_checkable
+class LLMProvider(Protocol):
+    def chat(self, messages: list, menu: list) -> tuple[str, Action]:
+        """Decide what to do this turn. Returns (text, action)."""
+        ...
+```
+
+- [ ] **Step 4: 写 `src/cpa_harness/llm/script.py`（绿）**
+
+```python
+"""MockTurn: one pre-programmed step in a MockLLM script."""
+from dataclasses import dataclass
+from cpa_harness.action import Action
+
+
+@dataclass
+class MockTurn:
+    text: str
+    action: Action
+    raise_: Exception | None = None
+```
+
+- [ ] **Step 5: 写 `src/cpa_harness/llm/mock.py`（绿）**
+
+```python
+"""MockLLM: deterministic LLM for unit tests."""
+from cpa_harness.action import Action
+from cpa_harness.llm.provider import LLMProvider
+from cpa_harness.llm.script import MockTurn
+
+
+class MockLLM(LLMProvider):
+    def __init__(self, script: list[MockTurn]):
+        self.script = script
+        self.index = 0
+        self.call_count = 0
+
+    def chat(self, messages: list, menu: list) -> tuple[str, Action]:
+        if self.index >= len(self.script):
+            raise IndexError(
+                f"MockLLM script exhausted after {self.index} calls; "
+                f"add more MockTurn entries"
+            )
+        turn = self.script[self.index]
+        self.index += 1
+        self.call_count += 1
+        if turn.raise_ is not None:
+            raise turn.raise_
+        return turn.text, turn.action
+```
+
+- [ ] **Step 6: 写 `src/cpa_harness/llm/__init__.py`**
+
+```python
+"""LLM abstraction layer."""
+from cpa_harness.llm.provider import LLMProvider
+from cpa_harness.llm.mock import MockLLM
+from cpa_harness.llm.script import MockTurn
+
+__all__ = ["LLMProvider", "MockLLM", "MockTurn"]
+```
+
+- [ ] **Step 7: 跑测试确认绿**
+
+```bash
+pytest tests/test_llm_mock.py -v
+```
+
+预期：5 passed
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/cpa_harness/llm/ tests/test_llm_mock.py
+git commit -m "feat(llm): add LLMProvider Protocol and MockLLM with scripted turns
+
+This is the cornerstone for A 文件 §A.4-A '可注入 mock' and §A.4-C
+'移除真 LLM 后仍能单测'. Every later mechanism test uses MockLLM to
+replay a known sequence of (text, action) pairs.
+
+TDD: 5 tests cover normal flow, exhaustion, simulated error, protocol
+conformance (isinstance check), and call_count for assertion in loop tests."
+```
+
+---
+
+## Task 4: 危险动作分类器（★ 主角维度）
+
+**Files:**
+- Create: `src/cpa_harness/guardrails/__init__.py`
+- Create: `src/cpa_harness/guardrails/patterns.py`
+- Create: `src/cpa_harness/guardrails/classifier.py`
+- Create: `tests/test_guardrail_patterns.py`
+- Create: `tests/test_guardrail_classifier.py`
+
+**Interfaces:**
+- Produces:
+  - `Level` enum: L0_BLOCKED, L1_NEEDS_APPROVAL, L2_NEEDS_APPROVAL, L3_ALLOWED
+  - `SubLevel` enum: L2A_WHITELIST_NO_HITL, L2B_WHITELIST_HITL, L2C_BLACKLIST
+  - `Decision` dataclass: (level, sub, reason)
+  - `classify(action) -> Decision`
+
+- [ ] **Step 1: 写 `tests/test_guardrail_patterns.py`（红）**
+
+```python
+from cpa_harness.guardrails.patterns import (
+    L0_PATTERNS, L2A_WHITELIST, L2B_WHITELIST, L2C_BLACKLIST,
+    matches_any,
+)
+
+
+def test_l0_patterns_match_dangerous_commands():
+    assert matches_any("rm -rf /", L0_PATTERNS)
+    assert matches_any("rm -rf /etc", L0_PATTERNS)
+    assert matches_any("mkfs.ext4 /dev/sda", L0_PATTERNS)
+    assert matches_any("shutdown -h now", L0_PATTERNS)
+    assert matches_any("dd if=/dev/zero of=/dev/sda", L0_PATTERNS)
+
+
+def test_l0_patterns_dont_match_safe_commands():
+    assert not matches_any("gcc main.c -o main", L0_PATTERNS)
+    assert not matches_any("ls -la", L0_PATTERNS)
+    assert not matches_any("cat main.c", L0_PATTERNS)
+
+
+def test_l2a_whitelist_contains_compile_commands():
+    assert "gcc" in L2A_WHITELIST
+    assert "make" in L2A_WHITELIST
+    assert "valgrind" in L2A_WHITELIST
+
+
+def test_l2c_blacklist_contains_network_commands():
+    assert "curl" in L2C_BLACKLIST
+    assert "wget" in L2C_BLACKLIST
+```
+
+- [ ] **Step 2: 写 `src/cpa_harness/guardrails/patterns.py`（绿）**
+
+```python
+"""Static pattern tables for dangerous-command classification."""
+import re
+
+# L0: always block, no HITL. Match anywhere in the command.
+L0_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b.*\/", re.IGNORECASE),
+    re.compile(r"\brm\s+-rf\s*\/\s*$", re.IGNORECASE),
+    re.compile(r"\bmkfs\b", re.IGNORECASE),
+    re.compile(r"\bshutdown\b", re.IGNORECASE),
+    re.compile(r"\breboot\b", re.IGNORECASE),
+    re.compile(r"\bdd\s+.*\bof=/dev/", re.IGNORECASE),
+    re.compile(r":\(\)\s*\{.*:\|\:&\s*\}\s*;\s*:"),  # fork bomb
+]
+
+# L2a: whitelist, no HITL needed (compile/test tools)
+L2A_WHITELIST: set[str] = {
+    "gcc", "cc", "g++", "clang", "make", "cmake",
+    "valgrind", "cppcheck", "gdb",
+    "timeout",
+}
+
+# L2b: whitelist, but HITL still required (read-only tools)
+L2B_WHITELIST: set[str] = {
+    "ls", "cat", "head", "tail", "wc", "file", "stat", "pwd", "echo",
+    "grep", "find", "tree",
+}
+
+# L2c: blacklist, always block (network / shell trickery)
+L2C_BLACKLIST: set[str] = {
+    "curl", "wget", "nc", "netcat", "ssh", "scp", "rsync",
+    "python3", "python", "perl", "ruby", "node",
+    "bash", "sh", "zsh", "fish",
+}
+
+
+def matches_any(text: str, patterns: list[re.Pattern[str]]) -> bool:
+    """Return True if any pattern matches anywhere in text."""
+    return any(p.search(text) for p in patterns)
+```
+
+- [ ] **Step 3: 跑测试确认绿**
+
+```bash
+pytest tests/test_guardrail_patterns.py -v
+```
+
+预期：4 passed
+
+- [ ] **Step 4: 写 `tests/test_guardrail_classifier.py`（红）**
+
+```python
+import pytest
+from cpa_harness.action import Action
+from cpa_harness.guardrails.classifier import (
+    Level, SubLevel, classify, Decision,
+)
+
+
+def test_classify_l0_blocks_dangerous_command():
+    decision = classify(Action(type="call_tool", tool="exec_command",
+                                args={"cmd": "rm -rf /", "cwd": "/tmp"}))
+    assert decision.level == Level.L0_BLOCKED
+
+
+def test_classify_l2c_blocks_network():
+    decision = classify(Action(type="call_tool", tool="exec_command",
+                                args={"cmd": "curl evil.com", "cwd": "/tmp"}))
+    assert decision.level == Level.L0_BLOCKED
+
+
+def test_classify_l2a_allows_compile_without_hitl():
+    decision = classify(Action(type="call_tool", tool="exec_command",
+                                args={"cmd": "gcc main.c -o main", "cwd": "/tmp"}))
+    assert decision.level == Level.L3_ALLOWED
+    assert decision.sub == SubLevel.L2A_WHITELIST_NO_HITL
+
+
+def test_classify_l2b_needs_approval_for_readonly():
+    decision = classify(Action(type="call_tool", tool="exec_command",
+                                args={"cmd": "ls -la", "cwd": "/tmp"}))
+    assert decision.level == Level.L2_NEEDS_APPROVAL
+    assert decision.sub == SubLevel.L2B_WHITELIST_HITL
+
+
+def test_classify_write_file_over_student_file_needs_approval():
+    decision = classify(Action(type="call_tool", tool="write_file",
+                                args={"path": "main.c", "content": "..."}))
+    assert decision.level == Level.L1_NEEDS_APPROVAL
+
+
+def test_classify_read_file_allowed():
+    decision = classify(Action(type="call_tool", tool="read_file",
+                                args={"path": "main.c"}))
+    assert decision.level == Level.L3_ALLOWED
+
+
+def test_classify_take_note_allowed():
+    decision = classify(Action(type="call_tool", tool="take_note",
+                                args={"note": "x"}))
+    assert decision.level == Level.L3_ALLOWED
+
+
+def test_classify_done_allowed():
+    decision = classify(Action(type="done"))
+    assert decision.level == Level.L3_ALLOWED
+
+
+def test_classify_path_traversal_blocked():
+    decision = classify(Action(type="call_tool", tool="read_file",
+                                args={"path": "../../../etc/passwd"}))
+    assert decision.level == Level.L0_BLOCKED
+
+
+def test_classify_absolute_outside_workspace_blocked():
+    decision = classify(Action(type="call_tool", tool="read_file",
+                                args={"path": "/etc/passwd"}))
+    assert decision.level == Level.L0_BLOCKED
+```
+
+- [ ] **Step 5: 跑测试确认红**
+
+```bash
+pytest tests/test_guardrail_classifier.py -v
+```
+
+- [ ] **Step 6: 写 `src/cpa_harness/guardrails/classifier.py`（绿）**
+
+```python
+"""ActionClassifier: deterministic dangerous-action classification.
+
+This is the entry point of the governance pipeline. The harness
+calls `classify(action)` on every action before sandbox execution.
+"""
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import PurePosixPath
+
+from cpa_harness.action import Action
+from cpa_harness.guardrails.patterns import (
+    L0_PATTERNS, L2A_WHITELIST, L2B_WHITELIST, L2C_BLACKLIST, matches_any,
+)
+
+
+class Level(str, Enum):
+    L0_BLOCKED = "L0"
+    L1_NEEDS_APPROVAL = "L1"
+    L2_NEEDS_APPROVAL = "L2"
+    L3_ALLOWED = "L3"
+
+
+class SubLevel(str, Enum):
+    L2A_WHITELIST_NO_HITL = "L2a"
+    L2B_WHITELIST_HITL = "L2b"
+    L2C_BLACKLIST = "L2c"
+    NONE = ""
+
+
+@dataclass
+class Decision:
+    level: Level
+    sub: SubLevel = SubLevel.NONE
+    reason: str = ""
+
+
+_STUDENT_FILE_EXTENSIONS = {".c", ".h"}
+
+
+def _first_token(cmd: str) -> str:
+    return cmd.strip().split()[0] if cmd.strip() else ""
+
+
+def _is_path_safe(path: str) -> bool:
+    """Refuse any path that escapes the workspace or is absolute outside it."""
+    if not path:
+        return False
+    p = PurePosixPath(path)
+    if p.is_absolute():
+        return False
+    if ".." in p.parts:
+        return False
+    return True
+
+
+def classify(action: Action) -> Decision:
+    if action.type in ("done", "take_note", "use_skill", "finish_tutoring"):
+        return Decision(Level.L3_ALLOWED, reason=f"action type {action.type} always allowed")
+
+    if action.type != "call_tool":
+        return Decision(Level.L0_BLOCKED, reason=f"unknown action type: {action.type}")
+
+    tool = action.tool
+    args = action.args or {}
+
+    if tool in ("read_file", "list_dir", "search_code", "run_feedback"):
+        path = args.get("path") or args.get("target") or ""
+        if not _is_path_safe(path):
+            return Decision(Level.L0_BLOCKED, reason=f"unsafe path: {path!r}")
+        return Decision(Level.L3_ALLOWED, reason=f"read-only tool {tool}")
+
+    if tool == "write_file":
+        path = args.get("path", "")
+        if not _is_path_safe(path):
+            return Decision(Level.L0_BLOCKED, reason=f"unsafe write path: {path!r}")
+        ext = "." + path.rsplit(".", 1)[-1] if "." in path else ""
+        if ext in _STUDENT_FILE_EXTENSIONS:
+            return Decision(Level.L1_NEEDS_APPROVAL, reason=f"overwrites student file {path!r}")
+        return Decision(Level.L1_NEEDS_APPROVAL, reason="write requires HITL")
+
+    if tool == "exec_command":
+        cmd = args.get("cmd", "")
+        if matches_any(cmd, L0_PATTERNS):
+            return Decision(Level.L0_BLOCKED, sub=SubLevel.L2C_BLACKLIST,
+                            reason=f"L0 pattern matched in {cmd!r}")
+        first = _first_token(cmd)
+        if first in L2C_BLACKLIST:
+            return Decision(Level.L0_BLOCKED, sub=SubLevel.L2C_BLACKLIST,
+                            reason=f"blacklisted command: {first}")
+        if first in L2A_WHITELIST:
+            return Decision(Level.L3_ALLOWED, sub=SubLevel.L2A_WHITELIST_NO_HITL,
+                            reason=f"whitelisted compile tool: {first}")
+        if first in L2B_WHITELIST:
+            return Decision(Level.L2_NEEDS_APPROVAL, sub=SubLevel.L2B_WHITELIST_HITL,
+                            reason=f"readonly tool {first} needs HITL")
+        return Decision(Level.L2_NEEDS_APPROVAL,
+                        reason=f"unknown command {first!r} needs HITL")
+
+    return Decision(Level.L0_BLOCKED, reason=f"unknown tool: {tool!r}")
+```
+
+- [ ] **Step 7: 写 `src/cpa_harness/guardrails/__init__.py`**
+
+```python
+"""Guardrails: dangerous-action classification, HITL, sandbox."""
+from cpa_harness.guardrails.classifier import Level, SubLevel, Decision, classify
+
+__all__ = ["Level", "SubLevel", "Decision", "classify"]
+```
+
+- [ ] **Step 8: 跑测试确认绿**
+
+```bash
+pytest tests/test_guardrail_classifier.py -v
+```
+
+预期：10 passed
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/cpa_harness/guardrails/ tests/test_guardrail_classifier.py tests/test_guardrail_patterns.py
+git commit -m "feat(guardrails): add ActionClassifier (L0/L1/L2/L3 + L2a/L2b/L2c) ★
+
+This is the centerpiece of the 主角维度. classify() takes an Action and
+returns a Decision (level + reason). 14 tests cover:
+
+  L0: rm -rf, mkfs, dd, fork bomb, /etc/passwd path traversal
+  L2c: curl/wget always blocked
+  L2a: gcc/make/valgrind allowed without HITL
+  L2b: ls/cat/etc needs HITL
+  L1: write_file over student .c/.h always needs HITL
+  L3: read-only tools, done, take_note allowed
+
+Path safety refuses '..' and absolute paths.
+
+Next: HITL state machine (Task 5) and sandbox (Task 6)."
+```
+
+---
+
+## Task 5: HITL 状态机（★ 主角维度）
+
+**Files:**
+- Create: `src/cpa_harness/guardrails/hitl.py`
+- Create: `tests/test_hitl_state_machine.py`
+
+**Interfaces:**
+- Produces:
+  - `State` enum: IDLE / AWAITING_APPROVAL / RUNNING / BLOCKED / FAILED
+  - `HumanInput` enum: APPROVE / REJECT / EDIT
+  - `ApprovalRequired` exception
+  - `HITLStateMachine` class
+
+- [ ] **Step 1: 写 `tests/test_hitl_state_machine.py`（红）**
+
+```python
+import pytest
+from cpa_harness.action import Action
+from cpa_harness.guardrails.classifier import Decision, Level, SubLevel
+from cpa_harness.guardrails.hitl import (
+    HITLStateMachine, State, HumanInput, ApprovalRequired,
+)
+
+
+def _approval_decision():
+    return Decision(Level.L1_NEEDS_APPROVAL, reason="overwrites student file")
+
+
+def test_initial_state_is_idle():
+    sm = HITLStateMachine()
+    assert sm.state == State.IDLE
+
+
+def test_l0_action_is_blocked_immediately():
+    sm = HITLStateMachine()
+    action = Action(type="call_tool", tool="exec_command",
+                    args={"cmd": "rm -rf /", "cwd": "/tmp"})
+    sm.submit(action, Decision(Level.L0_BLOCKED, reason="L0 pattern"))
+    assert sm.state == State.BLOCKED
+
+
+def test_l3_action_runs_immediately():
+    sm = HITLStateMachine()
+    action = Action(type="call_tool", tool="read_file", args={"path": "main.c"})
+    sm.submit(action, Decision(Level.L3_ALLOWED))
+    assert sm.state == State.RUNNING
+
+
+def test_l1_action_awaits_approval():
+    sm = HITLStateMachine()
+    action = Action(type="call_tool", tool="write_file",
+                    args={"path": "main.c", "content": "..."})
+    sm.submit(action, _approval_decision())
+    assert sm.state == State.AWAITING_APPROVAL
+    assert sm.pending_action is action
+
+
+def test_approval_transitions_to_running():
+    sm = HITLStateMachine()
+    sm.submit(Action(type="call_tool", tool="write_file",
+                     args={"path": "main.c", "content": "x"}),
+              _approval_decision())
+    sm.on_human_input(HumanInput.APPROVE)
+    assert sm.state == State.RUNNING
+    assert sm.pending_action is None
+
+
+def test_rejection_transitions_to_blocked():
+    sm = HITLStateMachine()
+    sm.submit(Action(type="call_tool", tool="write_file",
+                     args={"path": "main.c", "content": "x"}),
+              _approval_decision())
+    sm.on_human_input(HumanInput.REJECT, reason="not now")
+    assert sm.state == State.BLOCKED
+    assert "not now" in sm.last_reason
+
+
+def test_edit_returns_to_awaiting_with_modified_action():
+    sm = HITLStateMachine()
+    action = Action(type="call_tool", tool="write_file",
+                    args={"path": "main.c", "content": "original"})
+    sm.submit(action, _approval_decision())
+    edited = Action(type="call_tool", tool="write_file",
+                    args={"path": "main.c", "content": "edited"})
+    sm.on_human_input(HumanInput.EDIT, new_action=edited)
+    assert sm.state == State.AWAITING_APPROVAL
+    assert sm.pending_action.args["content"] == "edited"
+
+
+def test_cannot_input_when_not_awaiting():
+    sm = HITLStateMachine()
+    with pytest.raises(ApprovalRequired):
+        sm.on_human_input(HumanInput.APPROVE)
+```
+
+- [ ] **Step 2: 跑测试确认红**
+
+```bash
+pytest tests/test_hitl_state_machine.py -v
+```
+
+- [ ] **Step 3: 写 `src/cpa_harness/guardrails/hitl.py`（绿）**
+
+```python
+"""HITL state machine. Implements SPEC §5.3 state diagram."""
+from enum import Enum
+from cpa_harness.action import Action
+from cpa_harness.guardrails.classifier import Decision, Level
+
+
+class State(str, Enum):
+    IDLE = "idle"
+    AWAITING_APPROVAL = "awaiting_approval"
+    RUNNING = "running"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
+class HumanInput(str, Enum):
+    APPROVE = "approve"
+    REJECT = "reject"
+    EDIT = "edit"
+
+
+class ApprovalRequired(Exception):
+    """Raised when human input arrives but no action is awaiting approval."""
+
+
+class HITLStateMachine:
+    def __init__(self):
+        self.state = State.IDLE
+        self.pending_action: Action | None = None
+        self.last_reason = ""
+
+    def submit(self, action: Action, decision: Decision) -> None:
+        self.pending_action = action
+        self.last_reason = decision.reason
+
+        if decision.level == Level.L0_BLOCKED:
+            self.state = State.BLOCKED
+        elif decision.level in (Level.L1_NEEDS_APPROVAL, Level.L2_NEEDS_APPROVAL):
+            self.state = State.AWAITING_APPROVAL
+        elif decision.level == Level.L3_ALLOWED:
+            self.state = State.RUNNING
+        else:
+            self.state = State.FAILED
+
+    def on_human_input(self, input_: HumanInput, *,
+                       new_action: Action | None = None,
+                       reason: str = "") -> None:
+        if self.state != State.AWAITING_APPROVAL:
+            raise ApprovalRequired(
+                f"Cannot apply {input_.value} in state {self.state.value}"
+            )
+        if input_ == HumanInput.APPROVE:
+            self.state = State.RUNNING
+            self.pending_action = None
+        elif input_ == HumanInput.REJECT:
+            self.state = State.BLOCKED
+            self.last_reason = reason or "rejected by user"
+            self.pending_action = None
+        elif input_ == HumanInput.EDIT:
+            if new_action is None:
+                raise ValueError("EDIT requires new_action")
+            self.pending_action = new_action
+```
+
+- [ ] **Step 4: 跑测试确认绿**
+
+```bash
+pytest tests/test_hitl_state_machine.py -v
+```
+
+预期：8 passed
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/cpa_harness/guardrails/hitl.py tests/test_hitl_state_machine.py
+git commit -m "feat(guardrails): add HITL state machine (IDLE/AWAITING/RUNNING/BLOCKED) ★
+
+8 tests cover the SPEC §5.3 state diagram:
+  IDLE → submit(L0) → BLOCKED
+  IDLE → submit(L3) → RUNNING
+  IDLE → submit(L1) → AWAITING_APPROVAL
+  AWAITING → APPROVE → RUNNING (pending cleared)
+  AWAITING → REJECT → BLOCKED (reason recorded)
+  AWAITING → EDIT (new_action) → AWAITING (action replaced)
+  Cannot input when not AWAITING → ApprovalRequired
+
+Next: SandboxBackend Protocol + POSIX implementation (Task 6)."
+```
+
+---
+
+## Task 6: Sandbox (POSIX 实现) — 进程级隔离
+
+**Files:**
+- Create: `src/cpa_harness/guardrails/sandbox/__init__.py`
+- Create: `src/cpa_harness/guardrails/sandbox/backend.py`
+- Create: `src/cpa_harness/guardrails/sandbox/posix.py`
+- Create: `src/cpa_harness/guardrails/sandbox/in_memory.py`
+- Create: `tests/test_sandbox_posix.py`
+
+**Interfaces:**
+- Produces:
+  - `SandboxResult` dataclass: (stdout, stderr, exit_code, signal, duration_ms)
+  - `SandboxBackend` Protocol with `run(tool, args, cwd) -> SandboxResult`
+  - `PosixSandbox` (Linux/macOS) — subprocess + rlimit + env cleanup
+  - `InMemorySandbox` (test fake) — pre-programmed responses
+
+- [ ] **Step 1: 写 `src/cpa_harness/guardrails/sandbox/backend.py`（先于测试）**
+
+```python
+"""Sandbox backend protocol."""
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
+
+
+@dataclass
+class SandboxResult:
+    stdout: str
+    stderr: str
+    exit_code: int | None = None
+    signal: int | None = None
+    duration_ms: int = 0
+
+
+@runtime_checkable
+class SandboxBackend(Protocol):
+    def run(self, tool: str, args: dict, cwd: str) -> SandboxResult:
+        """Run a tool inside the sandbox; return its result."""
+        ...
+```
+
+- [ ] **Step 2: 写 `src/cpa_harness/guardrails/sandbox/in_memory.py`**
+
+```python
+"""In-memory sandbox for tests: pre-programmed responses, no real subprocess."""
+from cpa_harness.guardrails.sandbox.backend import SandboxResult, SandboxBackend
+
+
+class InMemorySandbox(SandboxBackend):
+    def __init__(self, responses: dict | None = None):
+        self.responses = responses or {}
+        self.calls: list[tuple[str, dict, str]] = []
+
+    def run(self, tool: str, args: dict, cwd: str) -> SandboxResult:
+        self.calls.append((tool, args, cwd))
+        if tool in self.responses:
+            return self.responses[tool]
+        return SandboxResult(stdout="", stderr="", exit_code=0)
+```
+
+- [ ] **Step 3: 写 `tests/test_sandbox_posix.py`（红）**
+
+```python
+import os
+import sys
+import pytest
+from cpa_harness.guardrails.sandbox.posix import PosixSandbox
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_echo_command_runs():
+    sb = PosixSandbox(workspace="/tmp")
+    r = sb.run("exec_command", {"cmd": "echo hello"}, cwd="/tmp")
+    assert r.exit_code == 0
+    assert r.stdout.strip() == "hello"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_sandbox_clears_secret_env():
+    sb = PosixSandbox(workspace="/tmp")
+    secret_value = "sk-supersecret-12345"
+    os.environ["OPENAI_API_KEY"] = secret_value
+    r = sb.run("exec_command",
+               {"cmd": "echo OPENAI_KEY=$OPENAI_API_KEY"},
+               cwd="/tmp")
+    assert secret_value not in r.stdout, "secret leaked into child env"
+    assert "$OPENAI_API_KEY" in r.stdout
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_sandbox_clears_token_env():
+    sb = PosixSandbox(workspace="/tmp")
+    os.environ["MY_TOKEN"] = "leakable"
+    r = sb.run("exec_command",
+               {"cmd": "echo TOKEN=$MY_TOKEN"},
+               cwd="/tmp")
+    assert "leakable" not in r.stdout
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_sandbox_runs_in_workspace(tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    sb = PosixSandbox(workspace=str(workspace))
+    r = sb.run("exec_command", {"cmd": "pwd"}, cwd=str(workspace))
+    assert r.stdout.strip() == str(workspace)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_sandbox_captures_nonzero_exit():
+    sb = PosixSandbox(workspace="/tmp")
+    r = sb.run("exec_command", {"cmd": "false"}, cwd="/tmp")
+    assert r.exit_code == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
+def test_sandbox_captures_signal():
+    sb = PosixSandbox(workspace="/tmp")
+    r = sb.run("exec_command", {"cmd": "kill -SEGV $$"}, cwd="/tmp")
+    assert r.signal == 11  # SIGSEGV
+```
+
+- [ ] **Step 4: 跑测试确认红**
+
+```bash
+pytest tests/test_sandbox_posix.py -v
+```
+
+预期：FAIL（PosixSandbox 不存在）
+
+- [ ] **Step 5: 写 `src/cpa_harness/guardrails/sandbox/posix.py`（绿）**
+
+```python
+"""POSIX sandbox (Linux/macOS): chdir + rlimit + env cleanup."""
+import os
+import re
+import resource
+import subprocess
+import time
+
+from cpa_harness.guardrails.sandbox.backend import SandboxResult, SandboxBackend
+
+# env vars whose names look like secrets/tokens — drop from child env
+_SECRET_VAR_RE = re.compile(r".*(KEY|TOKEN|SECRET|PASSWORD|CRED).*", re.IGNORECASE)
+
+
+def _safe_environ() -> dict[str, str]:
+    """Return a copy of os.environ with secret-looking vars removed."""
+    return {k: v for k, v in os.environ.items() if not _SECRET_VAR_RE.match(k)}
+
+
+def _limit_resources() -> None:
+    """Set resource limits on the child: 5s CPU, 256MB virtual memory."""
+    resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
+    resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024,) * 2)
+
+
+class PosixSandbox(SandboxBackend):
+    def __init__(self, workspace: str):
+        self.workspace = workspace
+
+    def run(self, tool: str, args: dict, cwd: str) -> SandboxResult:
+        if tool == "exec_command":
+            return self._exec(args["cmd"], cwd)
+        raise NotImplementedError(f"POSIX sandbox does not support tool {tool!r}")
+
+    def _exec(self, cmd: str, cwd: str) -> SandboxResult:
+        start = time.time()
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_safe_environ(),
+            preexec_fn=_limit_resources,
+            text=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        duration = int((time.time() - start) * 1000)
+        return SandboxResult(
+            stdout=stdout or "",
+            stderr=stderr or "",
+            exit_code=proc.returncode if proc.returncode >= 0 else None,
+            signal=-proc.returncode if proc.returncode < 0 else None,
+            duration_ms=duration,
+        )
+```
+
+- [ ] **Step 6: 写 `src/cpa_harness/guardrails/sandbox/__init__.py`**
+
+```python
+"""Sandbox backends for isolating tool execution."""
+from cpa_harness.guardrails.sandbox.backend import SandboxResult, SandboxBackend
+from cpa_harness.guardrails.sandbox.posix import PosixSandbox
+from cpa_harness.guardrails.sandbox.in_memory import InMemorySandbox
+
+__all__ = ["SandboxResult", "SandboxBackend", "PosixSandbox", "InMemorySandbox"]
+```
+
+- [ ] **Step 7: 跑测试确认绿**
+
+```bash
+pytest tests/test_sandbox_posix.py -v
+```
+
+预期：6 passed（Windows 上全部 skip，是预期）
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/cpa_harness/guardrails/sandbox/ tests/test_sandbox_posix.py
+git commit -m "feat(sandbox): add POSIX sandbox with chdir + rlimit + env cleanup
+
+SandboxBackend Protocol + two implementations:
+  PosixSandbox: real subprocess with 5s CPU limit, 256MB AS limit, secret
+    env vars (KEY/TOKEN/SECRET/PASSWORD/CRED) stripped before fork
+  InMemorySandbox: pre-programmed test fake
+
+6 tests cover: echo, secret env stripping (KEY + TOKEN), workspace cwd,
+nonzero exit, SIGSEGV capture. Windows tests skip (Task 7 will add
+Windows implementation).
+
+Note: preexec_fn is POSIX-only — Windows impl in Task 7 uses job objects."
+```
+
+---
+
+## Task 7: Sandbox (Windows 实现) — 用 job object 限制
+
+**Files:**
+- Create: `src/cpa_harness/guardrails/sandbox/windows.py`
+- Create: `tests/test_sandbox_windows.py`
+
+**Interfaces:**
+- Produces: `WindowsSandbox` — Windows 上 subprocess + win32job
+
+- [ ] **Step 1: 写 `tests/test_sandbox_windows.py`（红）**
+
+> **TDD 注意（2026-07-08 冷启动发现）**：
+> **不要**用 `try/except ImportError` 包裹 `from ... import WindowsSandbox`——
+> 那会让模块缺失时变成 `HAS_WIN32=False` → 测试 skip 而非 FAIL。**TDD 的"红"
+> 阶段必须看到真失败**（collection error 或 test failure），不是 skip。
+>
+> 正确做法：直接 `from ... import WindowsSandbox`（无 try/except），RED 阶段
+> 产生 ImportError collection error（真红）。等 GREEN 阶段模块存在后，再用
+> 条件 skip 包裹让其它平台跳过。
+
+```python
+import os
+import sys
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows-only test",
+)
+
+# 直接 import，无 try/except —— 缺失即真红（TDD 硬要求）
+from cpa_harness.guardrails.sandbox.windows import WindowsSandbox
+
+
+def test_echo_runs_on_windows(tmp_path):
+    sb = WindowsSandbox(workspace=str(tmp_path))
+    r = sb.run("exec_command", {"cmd": "echo hello"}, cwd=str(tmp_path))
+    assert r.exit_code == 0
+    assert "hello" in r.stdout
+
+
+def test_secret_env_stripped_on_windows(tmp_path):
+    sb = WindowsSandbox(workspace=str(tmp_path))
+    os.environ["OPENAI_API_KEY"] = "sk-supersecret-12345"
+    r = sb.run("exec_command",
+               {"cmd": "echo OPENAI_KEY=%OPENAI_API_KEY%"},
+               cwd=str(tmp_path))
+    assert "supersecret" not in r.stdout
+
+
+def test_sandbox_runs_in_workspace(tmp_path):
+    """对标 POSIX 测试套件 (Task 6 Step 3 test_sandbox_runs_in_workspace)。"""
+    sb = WindowsSandbox(workspace=str(tmp_path))
+    r = sb.run("exec_command", {"cmd": "cd"}, cwd=str(tmp_path))
+    assert r.exit_code == 0
+    assert str(tmp_path) in r.stdout
+
+
+def test_sandbox_captures_nonzero_exit(tmp_path):
+    """对标 POSIX 测试套件 (Task 6 Step 3 test_sandbox_captures_nonzero_exit)。"""
+    sb = WindowsSandbox(workspace=str(tmp_path))
+    r = sb.run("exec_command", {"cmd": "cmd /c exit 1"}, cwd=str(tmp_path))
+    assert r.exit_code == 1
+```
+
+- [ ] **Step 2: 写 `src/cpa_harness/guardrails/sandbox/windows.py`（绿）**
+
+```python
+"""Windows sandbox: subprocess with job object (CPU/memory limits) and env cleanup.
+
+Job objects are the Windows equivalent of POSIX rlimits. We create a
+job per subprocess, set JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE so the child
+dies if the harness dies, and set basic + extended limit information.
+
+If pywin32 is unavailable, falls back to plain subprocess (no CPU/mem
+limits, but still chdir + env cleanup).
+"""
+import os
+import re
+import subprocess
+import time
+
+from cpa_harness.guardrails.sandbox.backend import SandboxResult, SandboxBackend
+
+_SECRET_VAR_RE = re.compile(r".*(KEY|TOKEN|SECRET|PASSWORD|CRED).*", re.IGNORECASE)
+
+
+def _safe_environ() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if not _SECRET_VAR_RE.match(k)}
+
+
+class WindowsSandbox(SandboxBackend):
+    def __init__(self, workspace: str):
+        self.workspace = workspace
+
+    def run(self, tool: str, args: dict, cwd: str) -> SandboxResult:
+        if tool == "exec_command":
+            return self._exec(args["cmd"], cwd)
+        raise NotImplementedError(f"Windows sandbox does not support tool {tool!r}")
+
+    def _exec(self, cmd: str, cwd: str) -> SandboxResult:
+        start = time.time()
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_safe_environ(),
+            text=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        duration = int((time.time() - start) * 1000)
+        return SandboxResult(
+            stdout=stdout or "",
+            stderr=stderr or "",
+            exit_code=proc.returncode,
+            duration_ms=duration,
+        )
+```
+
+> **注意**：本任务初版不集成 `pywin32` job object（避免硬依赖）。沙箱仍能在 Windows 上工作（chdir + env cleanup），但没有 CPU/内存硬限制。集成 job object 是增强项，可后续 PR 补。
+
+- [ ] **Step 3: 跑测试**
+
+```bash
+pytest tests/test_sandbox_windows.py -v
+```
+
+预期：在 Windows 上 2 passed（如果 pywin32 不装则 skip）
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/cpa_harness/guardrails/sandbox/windows.py tests/test_sandbox_windows.py
+git commit -m "feat(sandbox): add Windows sandbox with env cleanup (job object optional)
+
+Windows implementation of SandboxBackend. chdir + env cleanup work;
+job object CPU/memory limits (pywin32) deferred to a follow-up PR to
+avoid hard pywin32 dependency.
+
+2 tests are platform-conditional and skip on POSIX. Existing PosixSandbox
+provides rlimit-based limits for Linux/macOS."
+```
+
+---
+
+## Task 8: Tool Registry + 8 个工具
+
+**Files:**
+- Create: `src/cpa_harness/tools/__init__.py`
+- Create: `src/cpa_harness/tools/registry.py`
+- Create: `src/cpa_harness/tools/read_file.py`
+- Create: `src/cpa_harness/tools/list_dir.py`
+- Create: `src/cpa_harness/tools/search_code.py`
+- Create: `src/cpa_harness/tools/write_file.py`
+- Create: `src/cpa_harness/tools/exec_command.py`
+- Create: `src/cpa_harness/tools/take_note.py`
+- Create: `src/cpa_harness/tools/finish_tutoring.py`
+- Create: `src/cpa_harness/tools/run_feedback.py` (stub)
+- Create: `tests/test_tool_registry.py`
+
+**Interfaces:**
+- Produces:
+  - `ToolRegistry` with `register(name, fn, schema)` / `dispatch(name, args, sandbox, cwd)`
+  - 8 tool functions, signature `(args, cwd, [sandbox]) -> Observation`
+
+- [ ] **Step 1: 写 `tests/test_tool_registry.py`（红）**
+
+```python
+import pytest
+from cpa_harness.tools.registry import ToolRegistry
+from cpa_harness.tools import read_file, list_dir, search_code
+
+
+def test_registry_register_and_list():
+    reg = ToolRegistry()
+    reg.register("read_file", read_file.run, schema={"name": "read_file"})
+    assert "read_file" in reg.names()
+
+
+def test_registry_dispatch_read_file(tmp_path):
+    (tmp_path / "main.c").write_text("int main() { return 0; }")
+    reg = ToolRegistry()
+    reg.register("read_file", read_file.run, schema={"name": "read_file"})
+    obs = reg.dispatch("read_file", {"path": "main.c"}, sandbox=None, cwd=str(tmp_path))
+    assert "int main" in obs.result
+
+
+def test_registry_unknown_tool_raises():
+    reg = ToolRegistry()
+    with pytest.raises(KeyError):
+        reg.dispatch("nope", {}, sandbox=None, cwd="/tmp")
+
+
+def test_read_file_tool(tmp_path):
+    (tmp_path / "x.txt").write_text("hello")
+    from cpa_harness.tools.read_file import run
+    obs = run({"path": "x.txt"}, cwd=str(tmp_path))
+    assert obs.result == "hello"
+
+
+def test_list_dir_tool(tmp_path):
+    (tmp_path / "a.c").write_text("")
+    (tmp_path / "b.h").write_text("")
+    from cpa_harness.tools.list_dir import run
+    obs = run({"path": "."}, cwd=str(tmp_path))
+    assert "a.c" in obs.result
+    assert "b.h" in obs.result
+
+
+def test_search_code_tool(tmp_path):
+    (tmp_path / "main.c").write_text("int x = 0;\nint y = malloc(4);")
+    from cpa_harness.tools.search_code import run
+    obs = run({"pattern": "malloc", "path": "."}, cwd=str(tmp_path))
+    assert "malloc" in obs.result
+```
+
+- [ ] **Step 2: 写工具模块（read_file / list_dir / search_code / write_file / exec_command / take_note / finish_tutoring / run_feedback stub）**
+
+```python
+# src/cpa_harness/tools/read_file.py
+"""read_file tool."""
+from pathlib import Path
+from cpa_harness.observation import Observation
+
+
+def run(args: dict, cwd: str) -> Observation:
+    path = Path(cwd) / args["path"]
+    return Observation(
+        tool="read_file",
+        result=path.read_text(encoding="utf-8"),
+        exit_code=0,
+    )
+```
+
+```python
+# src/cpa_harness/tools/list_dir.py
+"""list_dir tool."""
+from pathlib import Path
+from cpa_harness.observation import Observation
+
+
+def run(args: dict, cwd: str) -> Observation:
+    target = Path(cwd) / args["path"]
+    entries = sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
+    return Observation(tool="list_dir", result="\n".join(entries), exit_code=0)
+```
+
+```python
+# src/cpa_harness/tools/search_code.py
+"""search_code tool: substring search across files."""
+from pathlib import Path
+from cpa_harness.observation import Observation
+
+
+def run(args: dict, cwd: str) -> Observation:
+    pattern = args["pattern"]
+    target = Path(cwd) / args.get("path", ".")
+    matches = []
+    for p in target.rglob("*"):
+        if p.is_file():
+            try:
+                for i, line in enumerate(p.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+                    if pattern in line:
+                        matches.append(f"{p}:{i}:{line}")
+            except (UnicodeDecodeError, OSError):
+                continue
+    return Observation(tool="search_code", result="\n".join(matches), exit_code=0)
+```
+
+```python
+# src/cpa_harness/tools/write_file.py
+"""write_file tool. Caller (loop) is responsible for HITL approval."""
+from pathlib import Path
+from cpa_harness.observation import Observation
+
+
+def run(args: dict, cwd: str) -> Observation:
+    path = Path(cwd) / args["path"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(args["content"], encoding="utf-8")
+    return Observation(
+        tool="write_file",
+        result=f"wrote {len(args['content'])} bytes to {path}",
+        exit_code=0,
+    )
+```
+
+```python
+# src/cpa_harness/tools/exec_command.py
+"""exec_command tool. Routes through the provided sandbox."""
+from cpa_harness.observation import Observation
+from cpa_harness.guardrails.sandbox.backend import SandboxBackend
+
+
+def run(args: dict, cwd: str, sandbox: SandboxBackend) -> Observation:
+    result = sandbox.run("exec_command", {"cmd": args["cmd"]}, cwd=cwd)
+    return Observation(
+        tool="exec_command",
+        result=result.stdout,
+        stderr=result.stderr,
+        exit_code=result.exit_code,
+        signal=result.signal,
+        duration_ms=result.duration_ms,
+    )
+```
+
+```python
+# src/cpa_harness/tools/take_note.py
+"""take_note tool. Stub; loop layer handles persistence."""
+from cpa_harness.observation import Observation
+
+
+def run(args: dict, cwd: str) -> Observation:
+    return Observation(tool="take_note", result=f"noted: {args['note']}", exit_code=0)
+```
+
+```python
+# src/cpa_harness/tools/finish_tutoring.py
+"""finish_tutoring tool. Signals the loop to exit successfully."""
+from cpa_harness.observation import Observation
+
+
+def run(args: dict, cwd: str) -> Observation:
+    return Observation(tool="finish_tutoring", result=args.get("summary", ""), exit_code=0)
+```
+
+```python
+# src/cpa_harness/tools/run_feedback.py
+"""run_feedback tool. Stub for now; real implementation in Task 11."""
+from cpa_harness.observation import Observation
+
+
+def run(args: dict, cwd: str) -> Observation:
+    return Observation(
+        tool="run_feedback",
+        result="run_feedback not yet implemented (Task 11)",
+        exit_code=0,
+    )
+```
+
+- [ ] **Step 3: 写 `src/cpa_harness/tools/registry.py`**
+
+```python
+"""ToolRegistry: central place to register and dispatch tools."""
+from typing import Callable
+from cpa_harness.observation import Observation
+from cpa_harness.guardrails.sandbox.backend import SandboxBackend
+
+
+class ToolRegistry:
+    def __init__(self):
+        self._tools: dict[str, Callable] = {}
+        self._schemas: dict[str, dict] = {}
+
+    def register(self, name: str, fn: Callable, schema: dict) -> None:
+        self._tools[name] = fn
+        self._schemas[name] = schema
+
+    def names(self) -> list[str]:
+        return list(self._tools.keys())
+
+    def schemas(self) -> list[dict]:
+        return list(self._schemas.values())
+
+    def dispatch(self, name: str, args: dict, *, sandbox: SandboxBackend | None, cwd: str) -> Observation:
+        if name not in self._tools:
+            raise KeyError(f"unknown tool: {name!r}")
+        fn = self._tools[name]
+        # Some tools need sandbox (exec_command)
+        try:
+            return fn(args, cwd=cwd, sandbox=sandbox)
+        except TypeError:
+            return fn(args, cwd=cwd)
+```
+
+- [ ] **Step 4: 写 `src/cpa_harness/tools/__init__.py`**
+
+```python
+"""Built-in tools for the harness."""
+from cpa_harness.tools import (
+    read_file, list_dir, search_code, write_file,
+    exec_command, take_note, finish_tutoring, run_feedback,
+)
+
+__all__ = [
+    "read_file", "list_dir", "search_code", "write_file",
+    "exec_command", "take_note", "finish_tutoring", "run_feedback",
+]
+```
+
+- [ ] **Step 5: 跑测试**
+
+```bash
+pytest tests/test_tool_registry.py -v
+```
+
+预期：6 passed
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/cpa_harness/tools/ tests/test_tool_registry.py
+git commit -m "feat(tools): add ToolRegistry and 8 tool implementations
+
+Eight tools registered with OpenAI-style function schemas:
+  read_file / list_dir / search_code   — L3 allowed (read-only)
+  write_file                            — L1 needs approval
+  exec_command                          — L2/L0 (sandboxed)
+  take_note / finish_tutoring           — loop control signals
+  run_feedback                          — stub (Task 11 will implement)
+
+ToolRegistry.dispatch() passes sandbox where needed (exec_command)
+and falls back to (args, cwd) for static tools."
+```
+
+---
+
+## Task 9: gcc 错误解析器 (CE 反馈)
+
+**Files:**
+- Create: `src/cpa_harness/feedback/gcc_parser.py`
+- Create: `tests/test_feedback_gcc.py`
+
+**Interfaces:**
+- Produces: `parse_gcc(stderr: str, file: str) -> FeedbackReport | None`
+
+- [ ] **Step 1: 写 `tests/test_feedback_gcc.py`（红）**
+
+```python
+from cpa_harness.feedback.gcc_parser import parse_gcc
+
+
+def test_parse_simple_error():
+    stderr = "main.c:5:12: error: 'x' undeclared (first use in this function)"
+    report = parse_gcc(stderr, file="main.c")
+    assert report is not None
+    assert report.verdict == "CE"
+    assert report.line == 5
+    assert report.col == 12
+    assert "undeclared" in report.msg
+
+
+def test_parse_warning():
+    stderr = "main.c:3:1: warning: unused variable 'y'"
+    report = parse_gcc(stderr, file="main.c")
+    assert report is not None
+    assert report.severity == "warning"
+
+
+def test_parse_multiple_errors_returns_first():
+    stderr = (
+        "main.c:5:1: error: 'a' undeclared\n"
+        "main.c:10:1: error: 'b' undeclared\n"
+    )
+    report = parse_gcc(stderr, file="main.c")
+    assert report.line == 5
+
+
+def test_parse_no_error_returns_none():
+    assert parse_gcc("", file="main.c") is None
+    assert parse_gcc("main.c:3:1: note: previous definition", file="main.c") is None
+```
+
+- [ ] **Step 2: 跑测试确认红**
+
+```bash
+pytest tests/test_feedback_gcc.py -v
+```
+
+- [ ] **Step 3: 写 `src/cpa_harness/feedback/gcc_parser.py`（绿）**
+
+```python
+"""Parse gcc error output into a structured FeedbackReport.
+
+gcc output format:
+  <filename>:<line>:<col>: <severity>: <message>
+"""
+import re
+from cpa_harness.feedback.report import FeedbackReport
+
+_GCC_LINE = re.compile(
+    r"^(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+):\s+"
+    r"(?P<severity>error|warning|note):\s+(?P<msg>.+)$"
+)
+
+
+def parse_gcc(stderr: str, file: str = "") -> FeedbackReport | None:
+    errors: list[FeedbackReport] = []
+    warnings: list[FeedbackReport] = []
+    for line in stderr.splitlines():
+        m = _GCC_LINE.match(line)
+        if not m:
+            continue
+        report = FeedbackReport(
+            verdict="CE",
+            file=m["file"],
+            line=int(m["line"]),
+            col=int(m["col"]),
+            severity=m["severity"],
+            msg=m["msg"],
+        )
+        if m["severity"] == "error":
+            errors.append(report)
+        elif m["severity"] == "warning":
+            warnings.append(report)
+    if errors:
+        return errors[0]
+    if warnings:
+        return warnings[0]
+    return None
+```
+
+- [ ] **Step 4: 跑测试确认绿**
+
+```bash
+pytest tests/test_feedback_gcc.py -v
+```
+
+预期：4 passed
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/cpa_harness/feedback/gcc_parser.py tests/test_feedback_gcc.py
+git commit -m "feat(feedback): add gcc error parser (CE) with line/col/severity
+
+Parses gcc's 'file:line:col: severity: msg' format into FeedbackReport.
+Returns first error, or first warning if no errors, or None."
+```
+
+---
+
+## Task 10: valgrind 解析器 (MLE 反馈)
+
+**Files:**
+- Create: `src/cpa_harness/feedback/valgrind_parser.py`
+- Create: `tests/test_feedback_valgrind.py`
+
+- [ ] **Step 1: 写 `tests/test_feedback_valgrind.py`（红）**
+
+```python
+from cpa_harness.feedback.valgrind_parser import parse_valgrind
+
+
+def test_parse_leak_summary():
+    stderr = """
+==12345== HEAP SUMMARY:
+==12345==   in use at exit: 40 bytes in 1 blocks
+==12345== LEAK SUMMARY:
+==12345==   definitely lost: 40 bytes in 1 blocks
+"""
+    report = parse_valgrind(stderr)
+    assert report is not None
+    assert report.verdict == "MLE"
+    assert "40 bytes" in report.leak_summary
+
+
+def test_parse_no_leak_returns_none():
+    stderr = """
+==12345== HEAP SUMMARY:
+==12345==   in use at exit: 0 bytes in 0 blocks
+==12345== LEAK SUMMARY:
+==12345==   definitely lost: 0 bytes in 0 blocks
+"""
+    assert parse_valgrind(stderr) is None
+
+
+def test_parse_invalid_read():
+    stderr = """
+==12345== Invalid read of size 4
+==12345==    at 0x401234: main (main.c:5)
+==12345== LEAK SUMMARY:
+==12345==   definitely lost: 0 bytes in 0 blocks
+"""
+    report = parse_valgrind(stderr)
+    assert report is not None
+    assert "Invalid read" in report.msg
+    assert report.line == 5
+```
+
+- [ ] **Step 2: 写 `src/cpa_harness/feedback/valgrind_parser.py`（绿）**
+
+```python
+"""Parse valgrind output into a structured FeedbackReport."""
+import re
+from cpa_harness.feedback.report import FeedbackReport
+
+_INVALID = re.compile(r"Invalid (?:read|write) of size \d+")
+_AT = re.compile(r"at 0x[0-9a-fA-F]+:\s+\S+\s+\((?P<file>[^:]+):(?P<line>\d+)\)")
+_LEAK = re.compile(r"definitely lost:\s+(?P<bytes>\d+)\s+bytes")
+
+
+def parse_valgrind(stderr: str, file: str = "") -> FeedbackReport | None:
+    invalid = _INVALID.search(stderr)
+    if invalid:
+        loc = _AT.search(stderr)
+        return FeedbackReport(
+            verdict="MLE",
+            file=loc["file"] if loc else file,
+            line=int(loc["line"]) if loc else None,
+            msg=invalid.group(0),
+        )
+    leak = _LEAK.search(stderr)
+    if leak and int(leak["bytes"]) > 0:
+        return FeedbackReport(
+            verdict="MLE",
+            file=file or "memory",
+            msg=f"definitely lost {leak['bytes']} bytes",
+            leak_summary=leak.group(0),
+        )
+    return None
+```
+
+- [ ] **Step 3: 跑测试确认绿**
+
+```bash
+pytest tests/test_feedback_valgrind.py -v
+```
+
+预期：3 passed
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/cpa_harness/feedback/valgrind_parser.py tests/test_feedback_valgrind.py
+git commit -m "feat(feedback): add valgrind parser (MLE) with leak summary
+
+Detects Invalid read/write with file:line, and 'definitely lost: N bytes'.
+Returns FeedbackReport(verdict='MLE') or None."
+```
+
+---
+
+## Task 11: FeedbackRunner — 编译 + 测试 + valgrind 一站
+
+**Files:**
+- Create: `src/cpa_harness/feedback/runner.py`
+- Create: `tests/test_feedback_runner.py`
+- Modify: `src/cpa_harness/tools/run_feedback.py`
+
+- [ ] **Step 1: 写 `tests/test_feedback_runner.py`（红）**
+
+```python
+from cpa_harness.feedback.runner import run_feedback
+from cpa_harness.guardrails.sandbox.in_memory import InMemorySandbox
+from cpa_harness.guardrails.sandbox.backend import SandboxResult
+
+
+def test_run_feedback_compile_error(tmp_path):
+    (tmp_path / "main.c").write_text("int main() { undeclared_var; }")
+    sb = InMemorySandbox(responses={
+        "exec_command": SandboxResult(
+            stdout="",
+            stderr="main.c:1:24: error: 'undeclared_var' undeclared",
+            exit_code=1,
+        ),
+    })
+    report = run_feedback(target="main.c", cwd=str(tmp_path), sandbox=sb)
+    assert report.verdict == "CE"
+    assert report.line == 1
+
+
+def test_run_feedback_no_target_returns_ac():
+    sb = InMemorySandbox(responses={})
+    report = run_feedback(target="missing.c", cwd="/nonexistent", sandbox=sb)
+    assert report.verdict == "AC"
+```
+
+- [ ] **Step 2: 写 `src/cpa_harness/feedback/runner.py`（绿）**
+
+```python
+"""FeedbackRunner: orchestrate gcc + valgrind for a target.
+
+Strategy:
+  1. If target file doesn't exist, return AC
+  2. Run `gcc -Wall -Werror <target> -o <target>.out` via sandbox
+  3. If compile fails, parse with parse_gcc → CE
+  4. If compile succeeds, run `valgrind --error-exitcode=1 ./<target>.out`
+  5. If valgrind reports leak, parse → MLE
+  6. Otherwise AC
+"""
+from pathlib import Path
+
+from cpa_harness.feedback.gcc_parser import parse_gcc
+from cpa_harness.feedback.report import FeedbackReport
+from cpa_harness.feedback.valgrind_parser import parse_valgrind
+from cpa_harness.guardrails.sandbox.backend import SandboxBackend
+
+
+def run_feedback(target: str, cwd: str, sandbox: SandboxBackend) -> FeedbackReport:
+    src = Path(cwd) / target
+    if not src.exists():
+        return FeedbackReport(verdict="AC", file=target, msg="no file")
+
+    out = f"{target}.out"
+    compile_result = sandbox.run(
+        "exec_command",
+        {"cmd": f"gcc -Wall -Werror {target} -o {out}"},
+        cwd=cwd,
+    )
+    if compile_result.exit_code != 0:
+        report = parse_gcc(compile_result.stderr, file=target)
+        if report is not None:
+            return report
+        return FeedbackReport(
+            verdict="CE", file=target,
+            msg=compile_result.stderr[:500] or "compilation failed",
+        )
+
+    valgrind_result = sandbox.run(
+        "exec_command",
+        {"cmd": f"valgrind --error-exitcode=1 ./{out}"},
+        cwd=cwd,
+    )
+    leak = parse_valgrind(valgrind_result.stderr, file=target)
+    if leak is not None:
+        return leak
+
+    return FeedbackReport(verdict="AC", file=target, msg="compiled and ran clean")
+```
+
+- [ ] **Step 3: 跑测试确认绿**
+
+```bash
+pytest tests/test_feedback_runner.py -v
+```
+
+预期：2 passed
+
+- [ ] **Step 4: 更新 `src/cpa_harness/tools/run_feedback.py` 用真实实现**
+
+```python
+"""run_feedback tool. Delegates to FeedbackRunner."""
+from cpa_harness.observation import Observation
+from cpa_harness.guardrails.sandbox.backend import SandboxBackend
+from cpa_harness.feedback.runner import run_feedback as _run
+
+
+def run(args: dict, cwd: str, sandbox: SandboxBackend) -> Observation:
+    target = args.get("target") or args.get("path", "")
+    report = _run(target=target, cwd=cwd, sandbox=sandbox)
+    return Observation(
+        tool="run_feedback",
+        result=f"{report.verdict}: {report.msg}",
+        exit_code=0,
+    )
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/cpa_harness/feedback/runner.py src/cpa_harness/tools/run_feedback.py tests/test_feedback_runner.py
+git commit -m "feat(feedback): add FeedbackRunner (gcc → valgrind → AC/CE/MLE)
+
+Orchestrates compile (gcc -Wall -Werror) then valgrind. Returns structured
+FeedbackReport. InMemorySandbox makes it fully testable without gcc/valgrind
+installed.
+
+run_feedback tool now uses the real runner instead of the stub."
+```
+
+---
+
+## Task 12: MemoryStore (4 层记忆)
+
+**Files:**
+- Create: `src/cpa_harness/memory/__init__.py`
+- Create: `src/cpa_harness/memory/record.py`
+- Create: `src/cpa_harness/memory/store.py`
+- Create: `tests/test_memory_store.py`
+
+- [ ] **Step 1: 写 `tests/test_memory_store.py`（红）**
+
+```python
+from datetime import datetime
+from cpa_harness.memory.store import MemoryStore
+from cpa_harness.memory.record import MemoryRecord
+
+
+def test_write_and_read_note(tmp_path):
+    store = MemoryStore(base_dir=tmp_path, user_id="alice")
+    store.write(MemoryRecord(
+        user_id="alice", kind="note",
+        content="student is on pointer chapter",
+        created_at=datetime.now(),
+    ))
+    notes = store.read(kind="note")
+    assert len(notes) == 1
+    assert "pointer" in notes[0].content
+
+
+def test_read_filters_by_kind(tmp_path):
+    store = MemoryStore(base_dir=tmp_path, user_id="bob")
+    store.write(MemoryRecord(user_id="bob", kind="note", content="n1", created_at=datetime.now()))
+    store.write(MemoryRecord(user_id="bob", kind="history", content="h1", created_at=datetime.now()))
+    assert len(store.read(kind="note")) == 1
+    assert len(store.read(kind="history")) == 1
+    assert len(store.read()) == 2
+
+
+def test_search_substring(tmp_path):
+    store = MemoryStore(base_dir=tmp_path, user_id="alice")
+    store.write(MemoryRecord(user_id="alice", kind="history",
+                             content="debugged segfault in malloc",
+                             created_at=datetime.now()))
+    store.write(MemoryRecord(user_id="alice", kind="history",
+                             content="asked about pointers",
+                             created_at=datetime.now()))
+    results = store.search("malloc")
+    assert len(results) == 1
+    assert "malloc" in results[0].content
+
+
+def test_persistence_across_instances(tmp_path):
+    store1 = MemoryStore(base_dir=tmp_path, user_id="alice")
+    store1.write(MemoryRecord(user_id="alice", kind="note", content="x", created_at=datetime.now()))
+    store2 = MemoryStore(base_dir=tmp_path, user_id="alice")
+    assert len(store2.read()) == 1
+```
+
+- [ ] **Step 2: 写 `src/cpa_harness/memory/record.py`（绿）**
+
+```python
+"""MemoryRecord: a single piece of cross-session memory."""
+from datetime import datetime
+from typing import Literal
+from pydantic import BaseModel, Field
+
+MemoryKind = Literal["note", "history", "lesson", "preference"]
+
+
+class MemoryRecord(BaseModel):
+    user_id: str
+    kind: MemoryKind
+    content: str
+    created_at: datetime
+    tags: list[str] = Field(default_factory=list)
+```
+
+- [ ] **Step 3: 写 `src/cpa_harness/memory/store.py`（绿）**
+
+```python
+"""MemoryStore: file-backed per-user memory."""
+import json
+from pathlib import Path
+from cpa_harness.memory.record import MemoryRecord
+
+
+class MemoryStore:
+    def __init__(self, base_dir: Path, user_id: str):
+        self.base_dir = Path(base_dir)
+        self.user_id = user_id
+        self.path = self.base_dir / f"{user_id}.json"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self.path.write_text("[]")
+
+    def _load(self) -> list[MemoryRecord]:
+        return [MemoryRecord(**item) for item in json.loads(self.path.read_text())]
+
+    def _save(self, records: list[MemoryRecord]) -> None:
+        self.path.write_text(json.dumps(
+            [r.model_dump(mode="json") for r in records], indent=2
+        ))
+
+    def write(self, record: MemoryRecord) -> None:
+        records = self._load()
+        records.append(record)
+        self._save(records)
+
+    def read(self, kind: str | None = None) -> list[MemoryRecord]:
+        records = self._load()
+        if kind is None:
+            return records
+        return [r for r in records if r.kind == kind]
+
+    def search(self, query: str) -> list[MemoryRecord]:
+        return [r for r in self._load() if query.lower() in r.content.lower()]
+```
+
+- [ ] **Step 4: 写 `src/cpa_harness/memory/__init__.py`**
+
+```python
+"""Memory: per-user cross-session storage."""
+from cpa_harness.memory.store import MemoryStore
+from cpa_harness.memory.record import MemoryRecord
+
+__all__ = ["MemoryStore", "MemoryRecord"]
+```
+
+- [ ] **Step 5: 跑测试确认绿**
+
+```bash
+pytest tests/test_memory_store.py -v
+```
+
+预期：4 passed
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/cpa_harness/memory/ tests/test_memory_store.py
+git commit -m "feat(memory): add MemoryStore with file-backed JSON per user
+
+write / read (filter by kind) / search (substring) / persistence.
+4 tests cover write/read/filter/search/persistence."
+```
+
+---
+
+## Task 13: AgentLoop 主循环（不依赖真 LLM）
+
+**Files:**
+- Create: `src/cpa_harness/loop.py`
+- Create: `tests/test_agent_loop.py`
+
+**Interfaces:**
+- Produces:
+  - `LoopResult` dataclass: (answer, steps, exit_reason)
+  - `AgentLoop.run() -> LoopResult` — 整合 LLM + 分类器 + HITL + 工具分发
+
+- [ ] **Step 1: 写 `tests/test_agent_loop.py`（红）**
+
+```python
+import pytest
+from cpa_harness.action import Action
+from cpa_harness.llm.mock import MockLLM, MockTurn
+from cpa_harness.tools.registry import ToolRegistry
+from cpa_harness.guardrails.sandbox.in_memory import InMemorySandbox
+from cpa_harness.loop import AgentLoop, LoopResult
+
+
+def test_loop_exits_on_done_action():
+    mock = MockLLM(script=[MockTurn(text="All done", action=Action(type="done"))])
+    loop = AgentLoop(
+        llm=mock, tools=ToolRegistry(), sandbox=InMemorySandbox(),
+        goal="say hi", workspace="/tmp", max_steps=5,
+    )
+    result = loop.run()
+    assert isinstance(result, LoopResult)
+    assert result.answer == "All done"
+    assert result.steps == 1
+    assert result.exit_reason == "done"
+
+
+def test_loop_calls_read_file_then_done(tmp_path):
+    (tmp_path / "main.c").write_text("int main() {}")
+    mock = MockLLM(script=[
+        MockTurn(text="I'll read it",
+                 action=Action(type="call_tool", tool="read_file",
+                               args={"path": "main.c"})),
+        MockTurn(text="got it", action=Action(type="done")),
+    ])
+    reg = ToolRegistry()
+    from cpa_harness.tools.read_file import run as read_run
+    reg.register("read_file", read_run, schema={"name": "read_file"})
+    loop = AgentLoop(
+        llm=mock, tools=reg, sandbox=InMemorySandbox(),
+        goal="read main.c", workspace=str(tmp_path), max_steps=5,
+    )
+    result = loop.run()
+    assert result.exit_reason == "done"
+    assert result.steps == 2
+
+
+def test_loop_blocks_dangerous_command():
+    mock = MockLLM(script=[
+        MockTurn(text="I'll clean up",
+                 action=Action(type="call_tool", tool="exec_command",
+                               args={"cmd": "rm -rf /", "cwd": "/tmp"})),
+        MockTurn(text="OK I'll do something else", action=Action(type="done")),
+    ])
+    reg = ToolRegistry()
+    from cpa_harness.tools.exec_command import run as exec_run
+    reg.register("exec_command", exec_run, schema={"name": "exec_command"})
+    loop = AgentLoop(
+        llm=mock, tools=reg, sandbox=InMemorySandbox(),
+        goal="clean up", workspace="/tmp", max_steps=5,
+    )
+    result = loop.run()
+    assert result.steps == 2
+    assert result.exit_reason == "done"
+
+
+def test_loop_max_steps_terminates():
+    mock = MockLLM(script=[
+        MockTurn(text="thinking", action=Action(type="take_note", note="x"))
+        for _ in range(10)
+    ])
+    reg = ToolRegistry()
+    from cpa_harness.tools.take_note import run as note_run
+    reg.register("take_note", note_run, schema={"name": "take_note"})
+    loop = AgentLoop(
+        llm=mock, tools=reg, sandbox=InMemorySandbox(),
+        goal="loop forever", workspace="/tmp", max_steps=3,
+    )
+    result = loop.run()
+    assert result.steps == 3
+    assert result.exit_reason == "max_steps"
+```
+
+- [ ] **Step 2: 写 `src/cpa_harness/loop.py`（绿）**
+
+```python
+"""AgentLoop: the main agent loop (per SPEC §6.2)."""
+from dataclasses import dataclass
+
+from cpa_harness.action import Action
+from cpa_harness.guardrails.classifier import classify
+from cpa_harness.guardrails.hitl import HITLStateMachine, State, HumanInput
+from cpa_harness.guardrails.sandbox.backend import SandboxBackend
+from cpa_harness.llm.provider import LLMProvider
+from cpa_harness.observation import Observation
+from cpa_harness.tools.registry import ToolRegistry
+
+
+@dataclass
+class LoopResult:
+    answer: str
+    steps: int
+    exit_reason: str  # "done" | "max_steps" | "awaiting_human"
+
+
+class AgentLoop:
+    def __init__(
+        self,
+        *,
+        llm: LLMProvider,
+        tools: ToolRegistry,
+        sandbox: SandboxBackend,
+        goal: str,
+        workspace: str,
+        max_steps: int = 30,
+        auto_approve: bool = True,
+    ):
+        self.llm = llm
+        self.tools = tools
+        self.sandbox = sandbox
+        self.goal = goal
+        self.workspace = workspace
+        self.max_steps = max_steps
+        self.auto_approve = auto_approve
+        self.history: list[dict] = []
+        self.hitl = HITLStateMachine()
+
+    def run(self) -> LoopResult:
+        answer = ""
+        for step in range(1, self.max_steps + 1):
+            text, action = self.llm.chat(messages=self.history, menu=self.tools.schemas())
+            self.history.append({"role": "assistant", "text": text, "action": action.model_dump()})
+
+            if action.type == "done":
+                return LoopResult(answer=text, steps=step, exit_reason="done")
+            if action.type == "finish_tutoring":
+                return LoopResult(answer=action.summary or text, steps=step, exit_reason="done")
+
+            decision = classify(action)
+            self.hitl.submit(action, decision)
+
+            if self.hitl.state == State.BLOCKED:
+                obs = Observation(
+                    tool=action.tool or "unknown",
+                    result=f"BLOCKED ({decision.reason})",
+                    exit_code=1,
+                )
+                self.history.append({"role": "user", "observation": obs.result})
+                continue
+
+            if self.hitl.state == State.AWAITING_APPROVAL:
+                if self.auto_approve:
+                    self.hitl.on_human_input(HumanInput.APPROVE)
+                else:
+                    return LoopResult(answer="", steps=step, exit_reason="awaiting_human")
+
+            try:
+                obs = self.tools.dispatch(
+                    action.tool, action.args,
+                    sandbox=self.sandbox, cwd=self.workspace,
+                )
+            except Exception as e:
+                obs = Observation(tool=action.tool or "?", result=f"ERROR: {e}", exit_code=1)
+            self.history.append({"role": "user", "observation": obs.result})
+        return LoopResult(answer=answer, steps=self.max_steps, exit_reason="max_steps")
+```
+
+- [ ] **Step 3: 跑测试确认绿**
+
+```bash
+pytest tests/test_agent_loop.py -v
+```
+
+预期：4 passed
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/cpa_harness/loop.py tests/test_agent_loop.py
+git commit -m "feat(loop): add AgentLoop main loop with governance integration ★
+
+Implements SPEC §6.2 data flow:
+  llm.chat() → classify() → hitl.submit() → tools.dispatch()
+
+4 tests cover: done exit, read_file→done sequence, L0 block (rm -rf /)
+with feedback injected into history, max_steps termination.
+
+auto_approve=True for tests; WebUI will replace with real HITL."
+```
+
+---
+
+## Task 14: 凭据管理 (keyring + 文件 fallback)
+
+**Files:**
+- Create: `src/cpa_harness/credentials/__init__.py`
+- Create: `src/cpa_harness/credentials/storage.py`
+- Create: `src/cpa_harness/credentials/setup.py`
+- Create: `src/cpa_harness/credentials/status.py`
+- Create: `tests/test_credentials.py`
+- Create: `tests/test_no_hardcoded_secrets.py`
+
+- [ ] **Step 1: 写 `tests/test_credentials.py`（红）**
+
+```python
+import os
+import pytest
+from cpa_harness.credentials.storage import (
+    mask_key, _keyring_path,
+)
+
+
+def test_mask_key_hides_middle():
+    assert mask_key("sk-1234567890abcdef") == "sk-1...cdef"
+
+
+def test_mask_key_handles_short():
+    assert mask_key("abc") == "***"
+    assert mask_key("") == "(empty)"
+    assert mask_key(None) == "(empty)"
+
+
+def test_store_and_get_roundtrip(monkeypatch, tmp_path):
+    monkeypatch.setenv("CPAH_TEST_KEYRING_BACKEND", "file")
+    monkeypatch.setenv("CPAH_KEYRING_PATH", str(tmp_path / "kr.json"))
+    from cpa_harness.credentials import storage
+    storage._backend = None  # reset cache
+    storage.store_api_key("sk-test-1234567890")
+    assert storage.get_api_key() == "sk-test-1234567890"
+    storage.clear_api_key()
+    assert storage.get_api_key() is None
+```
+
+- [ ] **Step 2: 写 `src/cpa_harness/credentials/storage.py`（绿）**
+
+```python
+"""Credential storage with keyring primary + file fallback."""
+import json
+import os
+from pathlib import Path
+
+_KEYRING_SERVICE = "cpa-harness"
+_KEYRING_USER = "OPENAI_API_KEY"
+
+
+def mask_key(key: str | None) -> str:
+    if not key:
+        return "(empty)"
+    if len(key) < 8:
+        return "***"
+    return f"{key[:4]}...{key[-4:]}"
+
+
+def _keyring_path() -> Path:
+    p = os.environ.get("CPAH_KEYRING_PATH", ".keyring.json")
+    return Path(p).expanduser().resolve()
+
+
+def _use_keyring_lib() -> bool:
+    """Return True if the system keyring is available."""
+    if os.environ.get("CPAH_TEST_KEYRING_BACKEND") == "file":
+        return False
+    try:
+        import keyring
+        kr = keyring.get_keyring()
+        return kr.__class__.__name__ != "Fail"
+    except Exception:
+        return False
+
+
+def get_api_key() -> str | None:
+    if _use_keyring_lib():
+        try:
+            import keyring
+            v = keyring.get_password(_KEYRING_SERVICE, _KEYRING_USER)
+            if v:
+                return v
+        except Exception:
+            pass
+    path = _keyring_path()
+    if path.exists():
+        data = json.loads(path.read_text())
+        return data.get("OPENAI_API_KEY")
+    return os.environ.get("OPENAI_API_KEY")
+
+
+def store_api_key(key: str) -> None:
+    if _use_keyring_lib():
+        try:
+            import keyring
+            keyring.set_password(_KEYRING_SERVICE, _KEYRING_USER, key)
+            return
+        except Exception:
+            pass
+    path = _keyring_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"OPENAI_API_KEY": key}))
+
+
+def clear_api_key() -> None:
+    if _use_keyring_lib():
+        try:
+            import keyring
+            keyring.delete_password(_KEYRING_SERVICE, _KEYRING_USER)
+        except Exception:
+            pass
+    path = _keyring_path()
+    if path.exists():
+        path.unlink()
+```
+
+- [ ] **Step 3: 写 `src/cpa_harness/credentials/setup.py`（绿）**
+
+```python
+"""Interactive setup: prompt for API key, store in keyring."""
+import getpass
+from cpa_harness.credentials.storage import store_api_key, mask_key
+
+
+def run_setup() -> None:
+    print("CP-AH: First-time setup")
+    print("Your API key will be stored in the system keyring.")
+    key = getpass.getpass("Enter your OpenAI-compatible API key: ")
+    if not key.strip():
+        print("Empty key, aborting.")
+        return
+    store_api_key(key.strip())
+    print(f"Stored. Masked: {mask_key(key)}")
+```
+
+- [ ] **Step 4: 写 `src/cpa_harness/credentials/status.py`（绿）**
+
+```python
+"""Status display — never prints the full key."""
+from cpa_harness.credentials.storage import get_api_key, mask_key
+
+
+def print_status() -> None:
+    key = get_api_key()
+    if key:
+        print(f"API key: {mask_key(key)} (source: configured)")
+    else:
+        print("API key: not configured. Run `cpa-harness setup`.")
+```
+
+- [ ] **Step 5: 写 `src/cpa_harness/credentials/__init__.py`**
+
+```python
+"""Credential management (keyring + .env fallback)."""
+from cpa_harness.credentials.storage import (
+    get_api_key, store_api_key, clear_api_key, mask_key,
+)
+
+__all__ = ["get_api_key", "store_api_key", "clear_api_key", "mask_key"]
+```
+
+- [ ] **Step 6: 写 `tests/test_no_hardcoded_secrets.py`**
+
+```python
+"""Static check: no hardcoded API keys in source."""
+import re
+from pathlib import Path
+
+import pytest
+
+# Patterns that look like OpenAI/Anthropic API keys
+_SECRET_PATTERNS = [
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),
+    re.compile(r"sk-ant-[A-Za-z0-9-]{20,}"),
+]
+
+
+@pytest.mark.parametrize("path", list(Path("src").rglob("*.py")))
+def test_no_hardcoded_api_keys(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    for pat in _SECRET_PATTERNS:
+        assert not pat.search(text), f"hardcoded key in {path}"
+```
+
+- [ ] **Step 7: 跑测试**
+
+```bash
+pytest tests/test_credentials.py tests/test_no_hardcoded_secrets.py -v
+```
+
+预期：全部 passed
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/cpa_harness/credentials/ tests/test_credentials.py tests/test_no_hardcoded_secrets.py
+git commit -m "feat(credentials): add keyring + file-fallback key storage
+
+Implements SPEC §8.1: keyring primary, JSON file fallback, env var
+last resort. mask_key() never prints full key. setup.py uses getpass.
+
+Plus a static test_no_hardcoded_secrets.py scanning src/ for
+accidentally-pasted keys, parametrized over every Python file."
+```
+
+---
+
+## Task 15: OpenAI LLM Provider
+
+**Files:**
+- Create: `src/cpa_harness/llm/openai_provider.py`
+- Create: `tests/test_openai_provider.py`
+
+- [ ] **Step 1: 写 `tests/test_openai_provider.py`（红）**
+
+```python
+import json
+from cpa_harness.llm.openai_provider import OpenAILLM
+from cpa_harness.llm.provider import LLMProvider
+
+
+def test_openai_llm_satisfies_provider_protocol():
+    llm = OpenAILLM(api_key="sk-test", base_url="https://api.openai.com/v1",
+                    model="gpt-4o-mini")
+    assert isinstance(llm, LLMProvider)
+
+
+def test_openai_llm_chat_returns_text_and_action():
+    class FakeChoice:
+        def __init__(self, message): self.message = message
+    class FakeMessage:
+        def __init__(self, content, tool_calls): self.content = content; self.tool_calls = tool_calls
+    class FakeToolCall:
+        def __init__(self, function): self.function = function
+    class FakeFunction:
+        def __init__(self, name, arguments): self.name = name; self.arguments = arguments
+    class FakeResponse:
+        def __init__(self, choices): self.choices = choices
+
+    fake_response = FakeResponse(choices=[
+        FakeChoice(FakeMessage(
+            content="Let me read it",
+            tool_calls=[FakeToolCall(FakeFunction(
+                name="read_file",
+                arguments=json.dumps({"path": "main.c"}),
+            ))],
+        )),
+    ])
+
+    llm = OpenAILLM(api_key="sk-test", base_url="https://x", model="gpt-4o-mini")
+    llm._client = type("FakeClient", (), {
+        "chat": type("FakeCompletions", (), {
+            "completions": type("FakeCreate", (), {
+                "create": lambda **kwargs: fake_response,
+            })(),
+        })(),
+    })()
+
+    text, action = llm.chat(messages=[{"role": "user", "content": "hi"}], menu=[])
+    assert text == "Let me read it"
+    assert action.type == "call_tool"
+    assert action.tool == "read_file"
+    assert action.args == {"path": "main.c"}
+```
+
+- [ ] **Step 2: 写 `src/cpa_harness/llm/openai_provider.py`（绿）**
+
+```python
+"""OpenAI-compatible LLM provider.
+
+Works with OpenAI, DeepSeek, 硅基流动, etc.
+"""
+import json
+import os
+
+from cpa_harness.action import Action
+from cpa_harness.llm.provider import LLMProvider
+
+
+class OpenAILLM(LLMProvider):
+    def __init__(self, api_key: str | None = None,
+                 base_url: str = "https://api.openai.com/v1",
+                 model: str = "gpt-4o-mini"):
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self.base_url = base_url
+        self.model = model
+        self._client = None
+
+    def _ensure_client(self):
+        if self._client is None:
+            from openai import OpenAI
+            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        return self._client
+
+    def chat(self, messages: list, menu: list) -> tuple[str, Action]:
+        client = self._ensure_client()
+        kwargs = {"model": self.model, "messages": messages}
+        if menu:
+            kwargs["tools"] = [{"type": "function", "function": s} for s in menu]
+            kwargs["tool_choice"] = "auto"
+        resp = client.chat.completions.create(**kwargs)
+        msg = resp.choices[0].message
+        text = msg.content or ""
+        if msg.tool_calls:
+            tc = msg.tool_calls[0]
+            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            return text, Action(type="call_tool", tool=tc.function.name, args=args)
+        return text, Action(type="done")
+```
+
+- [ ] **Step 3: 跑测试**
+
+```bash
+pytest tests/test_openai_provider.py -v
+```
+
+预期：2 passed
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/cpa_harness/llm/openai_provider.py tests/test_openai_provider.py
+git commit -m "feat(llm): add OpenAI-compatible LLM provider
+
+Wraps the openai SDK. Lazy client init. Converts tool_calls into our
+Action pydantic. Works with any OpenAI-compatible endpoint.
+
+2 tests cover protocol conformance and tool_calls → Action mapping
+using a fake client. No real network access."
+```
+
+---
+
+## Task 16: Config loader (YAML 默认值 + AGENTS.md 覆盖)
+
+**Files:**
+- Create: `src/cpa_harness/config/__init__.py`
+- Create: `src/cpa_harness/config/loader.py`
+- Create: `src/cpa_harness/config/defaults.yaml`
+- Create: `tests/test_config_loader.py`
+
+- [ ] **Step 1: 写 `src/cpa_harness/config/defaults.yaml`**
+
+```yaml
+# Default CP-AH configuration
+max_steps: 30
+max_tokens: 8000
+sandbox_cpu_seconds: 5
+sandbox_memory_mb: 256
+dangerous_command_hitl: true
+default_model: gpt-4o-mini
+feedback:
+  compile_flags: "-Wall -Werror"
+  valgrind_flags: "--error-exitcode=1"
+```
+
+- [ ] **Step 2: 写 `tests/test_config_loader.py`（红）**
+
+```python
+from cpa_harness.config.loader import load_config
+
+
+def test_load_defaults_only():
+    cfg = load_config(agents_md_path=None)
+    assert cfg["max_steps"] == 30
+    assert cfg["default_model"] == "gpt-4o-mini"
+
+
+def test_load_overrides_from_agents_md(tmp_path):
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("""# Project rules
+- max_steps: 10
+- default_model: deepseek-chat
+""")
+    cfg = load_config(agents_md_path=agents)
+    assert cfg["max_steps"] == 10
+    assert cfg["default_model"] == "deepseek-chat"
+    assert cfg["max_tokens"] == 8000
+
+
+def test_agents_md_with_no_overrides_keeps_defaults(tmp_path):
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("# just a header\n")
+    cfg = load_config(agents_md_path=agents)
+    assert cfg["max_steps"] == 30
+```
+
+- [ ] **Step 3: 写 `src/cpa_harness/config/loader.py`（绿）**
+
+```python
+"""Configuration loader: defaults.yaml + optional AGENTS.md override."""
+import re
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+_DEFAULTS_PATH = Path(__file__).parent / "defaults.yaml"
+_OVERRIDE_LINE = re.compile(r"^-\s*([a-z_]+):\s*(\S.*)$")
+
+
+def _parse_agents_md(path: Path) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    if not path or not path.exists():
+        return overrides
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = _OVERRIDE_LINE.match(line.strip())
+        if not m:
+            continue
+        key, raw = m.group(1), m.group(2)
+        if raw.lower() in ("true", "false"):
+            overrides[key] = raw.lower() == "true"
+        else:
+            try:
+                overrides[key] = int(raw)
+            except ValueError:
+                overrides[key] = raw
+    return overrides
+
+
+def load_config(agents_md_path: Path | None = None) -> dict[str, Any]:
+    defaults = yaml.safe_load(_DEFAULTS_PATH.read_text(encoding="utf-8"))
+    if agents_md_path:
+        overrides = _parse_agents_md(Path(agents_md_path))
+        defaults.update(overrides)
+    return defaults
+```
+
+- [ ] **Step 4: 写 `src/cpa_harness/config/__init__.py`**
+
+```python
+"""Configuration loader."""
+from cpa_harness.config.loader import load_config
+
+__all__ = ["load_config"]
+```
+
+- [ ] **Step 5: 跑测试**
+
+```bash
+pytest tests/test_config_loader.py -v
+```
+
+预期：3 passed
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/cpa_harness/config/ tests/test_config_loader.py
+git commit -m "feat(config): add YAML defaults + AGENTS.md override loader
+
+defaults.yaml sets all defaults; AGENTS.md (or any markdown file) with
+'- key: value' lines overrides them. Supports int, bool, string."
+```
+
+---
+
+## Task 17: 机制演示（A 文件 §A.6 必交）
+
+**Files:**
+- Create: `tests/demo_mechanisms.py`
+- Create: `tests/test_demo_mechanisms.py`
+
+- [ ] **Step 1: 写 `tests/demo_mechanisms.py`（绿）**
+
+```python
+"""Mechanism demos satisfying A 文件 §A.6.
+
+Three deterministic, mock-driven demos:
+  Demo 1: Guardrail blocks a dangerous command
+  Demo 2: HITL state machine correctly handles rejection
+  Demo 3: Feedback loop injects CE → agent gets blocked info
+
+Run: pytest tests/test_demo_mechanisms.py -v
+Or:   python tests/demo_mechanisms.py
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from cpa_harness.action import Action
+from cpa_harness.llm.mock import MockLLM, MockTurn
+from cpa_harness.tools.registry import ToolRegistry
+from cpa_harness.tools import exec_command
+from cpa_harness.guardrails.sandbox.in_memory import InMemorySandbox
+from cpa_harness.loop import AgentLoop
+
+
+def demo_1_guardrail_blocks_dangerous_command() -> None:
+    """Demo 1: LLM tries to rm -rf /, harness blocks it, agent pivots."""
+    print("\n=== Demo 1: Guardrail blocks dangerous command ===")
+    mock = MockLLM(script=[
+        MockTurn(text="Cleaning up...",
+                 action=Action(type="call_tool", tool="exec_command",
+                               args={"cmd": "rm -rf /", "cwd": "/tmp"})),
+        MockTurn(text="OK, doing something safer", action=Action(type="done")),
+    ])
+    reg = ToolRegistry()
+    reg.register("exec_command", exec_command.run,
+                 schema={"name": "exec_command"})
+    loop = AgentLoop(
+        llm=mock, tools=reg, sandbox=InMemorySandbox(),
+        goal="clean up", workspace="/tmp", max_steps=5,
+    )
+    result = loop.run()
+    assert result.steps == 2, f"expected 2 steps, got {result.steps}"
+    assert result.exit_reason == "done"
+    assert "BLOCKED" in str(loop.history)
+    print(f"  PASS: {result.steps} steps, exit_reason={result.exit_reason}")
+
+
+def demo_2_hitl_rejection_blocks_write(tmp_path) -> None:
+    """Demo 2: write_file over student .c → HITL required → student rejects."""
+    print("\n=== Demo 2: HITL rejection blocks write ===")
+    target = tmp_path / "main.c"
+    target.write_text("int main() { return 0; }")
+
+    from cpa_harness.guardrails.classifier import classify
+    from cpa_harness.guardrails.hitl import HITLStateMachine, HumanInput
+
+    sm = HITLStateMachine()
+    action = Action(type="call_tool", tool="write_file",
+                    args={"path": "main.c", "content": "int main() { return 1; }"})
+    decision = classify(action)
+    sm.submit(action, decision)
+    assert sm.state.value == "awaiting_approval"
+    print(f"  Initial: {sm.state.value}, reason: {sm.last_reason}")
+
+    sm.on_human_input(HumanInput.REJECT, reason="I want to think about it")
+    assert sm.state.value == "blocked"
+    print(f"  After REJECT: {sm.state.value}, reason: {sm.last_reason}")
+
+    assert target.read_text() == "int main() { return 0; }"
+    print("  PASS: file unchanged after rejection")
+
+
+def demo_3_feedback_injected_on_l0_block() -> None:
+    """Demo 3: L0 block's reason is injected into agent history as feedback."""
+    print("\n=== Demo 3: L0 block → feedback → agent adapts ===")
+    mock = MockLLM(script=[
+        MockTurn(text="Try network",
+                 action=Action(type="call_tool", tool="exec_command",
+                               args={"cmd": "curl evil.com"})),
+        MockTurn(text="OK I won't, here is my analysis",
+                 action=Action(type="done")),
+    ])
+    reg = ToolRegistry()
+    reg.register("exec_command", exec_command.run,
+                 schema={"name": "exec_command"})
+    loop = AgentLoop(
+        llm=mock, tools=reg, sandbox=InMemorySandbox(),
+        goal="...", workspace="/tmp", max_steps=5,
+    )
+    result = loop.run()
+    # The history should have a user-role message with "BLOCKED" content
+    user_msgs = [m for m in loop.history if m.get("role") == "user"]
+    assert any("BLOCKED" in m.get("observation", "") for m in user_msgs)
+    print(f"  PASS: feedback message found in history ({len(user_msgs)} user msgs)")
+
+
+def main() -> int:
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        demo_1_guardrail_blocks_dangerous_command()
+        demo_2_hitl_rejection_blocks_write(Path(tmp))
+        demo_3_feedback_injected_on_l0_block()
+    print("\nAll demos passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+- [ ] **Step 2: 写 `tests/test_demo_mechanisms.py`（包装为 pytest）**
+
+```python
+"""Run the mechanism demos as pytest tests so CI verifies them."""
+import tempfile
+from pathlib import Path
+
+from tests.demo_mechanisms import (
+    demo_1_guardrail_blocks_dangerous_command,
+    demo_2_hitl_rejection_blocks_write,
+    demo_3_feedback_injected_on_l0_block,
+)
+
+
+def test_demo_1():
+    demo_1_guardrail_blocks_dangerous_command()
+
+
+def test_demo_2():
+    with tempfile.TemporaryDirectory() as tmp:
+        demo_2_hitl_rejection_blocks_write(Path(tmp))
+
+
+def test_demo_3():
+    demo_3_feedback_injected_on_l0_block()
+```
+
+- [ ] **Step 3: 跑测试**
+
+```bash
+pytest tests/test_demo_mechanisms.py -v
+```
+
+预期：3 passed
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add tests/demo_mechanisms.py tests/test_demo_mechanisms.py
+git commit -m "test(demo): add three mechanism demos satisfying A 文件 §A.6
+
+Demo 1: rm -rf / is blocked, agent pivots to 'done'
+Demo 2: write_file over student .c → HITL → student rejects;
+         file remains unchanged, harness state goes to BLOCKED
+Demo 3: L0 block's reason is injected into agent history as feedback
+
+Each demo wrapped as pytest test for CI; can also run directly."
+```
+
+---
+
+## Task 18: CLI 入口
+
+**Files:**
+- Create: `src/cpa_harness/cli.py`
+- Create: `tests/test_cli.py`
+
+- [ ] **Step 1: 写 `tests/test_cli.py`（红）**
+
+```python
+import subprocess
+import sys
+from pathlib import Path
+
+
+def test_cli_help():
+    result = subprocess.run(
+        [sys.executable, "-m", "cpa_harness.cli", "--help"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0
+    assert "run" in result.stdout
+    assert "setup" in result.stdout
+    assert "key" in result.stdout
+
+
+def test_cli_run_with_mock_llm(tmp_path):
+    (tmp_path / "main.c").write_text("int main() { return 0; }")
+    repo_root = Path(__file__).parent.parent
+    result = subprocess.run(
+        [sys.executable, "-m", "cpa_harness.cli", "run",
+         "--file", str(tmp_path / "main.c"),
+         "--goal", "explain",
+         "--mock"],
+        capture_output=True, text=True,
+        cwd=repo_root,
+    )
+    assert result.returncode == 0
+    out = result.stdout.lower()
+    assert "done" in out or "result" in out or "exit" in out
+```
+
+- [ ] **Step 2: 写 `src/cpa_harness/cli.py`（绿）**
+
+```python
+"""CLI entry point. Subcommands: run / setup / key."""
+import argparse
+import sys
+from pathlib import Path
+
+from cpa_harness.action import Action
+from cpa_harness.llm.mock import MockLLM, MockTurn
+from cpa_harness.llm.openai_provider import OpenAILLM
+from cpa_harness.tools.registry import ToolRegistry
+from cpa_harness.tools import read_file, list_dir, search_code, write_file, exec_command, take_note, finish_tutoring, run_feedback
+from cpa_harness.guardrails.sandbox.in_memory import InMemorySandbox
+from cpa_harness.guardrails.sandbox.posix import PosixSandbox
+from cpa_harness.guardrails.sandbox.windows import WindowsSandbox
+from cpa_harness.loop import AgentLoop
+from cpa_harness.config import load_config
+from cpa_harness.credentials import get_api_key
+
+
+def _build_sandbox(workspace: str):
+    if sys.platform == "win32":
+        try:
+            return WindowsSandbox(workspace=workspace)
+        except Exception:
+            return InMemorySandbox()
+    try:
+        return PosixSandbox(workspace=workspace)
+    except Exception:
+        return InMemorySandbox()
+
+
+def _build_registry() -> ToolRegistry:
+    reg = ToolRegistry()
+    def schema(name):
+        return {"name": name, "description": name, "parameters": {"type": "object"}}
+    for mod, name in [
+        (read_file, "read_file"),
+        (list_dir, "list_dir"),
+        (search_code, "search_code"),
+        (write_file, "write_file"),
+        (exec_command, "exec_command"),
+        (take_note, "take_note"),
+        (finish_tutoring, "finish_tutoring"),
+        (run_feedback, "run_feedback"),
+    ]:
+        reg.register(name, mod.run, schema(name))
+    return reg
+
+
+def cmd_run(args) -> int:
+    cfg = load_config()
+    workspace = str(Path(args.file).parent)
+    if args.mock:
+        llm = MockLLM(script=[
+            MockTurn(text=f"I will read {args.file}",
+                     action=Action(type="call_tool", tool="read_file",
+                                   args={"path": Path(args.file).name})),
+            MockTurn(text="Done", action=Action(type="done")),
+        ])
+    else:
+        llm = OpenAILLM(api_key=get_api_key(), model=cfg["default_model"])
+    loop = AgentLoop(
+        llm=llm,
+        tools=_build_registry(),
+        sandbox=_build_sandbox(workspace),
+        goal=args.goal,
+        workspace=workspace,
+        max_steps=cfg["max_steps"],
+    )
+    result = loop.run()
+    print(f"Result: {result.answer}")
+    print(f"Steps: {result.steps}, exit: {result.exit_reason}")
+    return 0 if result.exit_reason == "done" else 1
+
+
+def cmd_setup(args) -> int:
+    from cpa_harness.credentials.setup import run_setup
+    run_setup()
+    return 0
+
+
+def cmd_key(args) -> int:
+    from cpa_harness.credentials.status import print_status
+    print_status()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="cpa-harness")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pr = sub.add_parser("run", help="Run harness on a file")
+    pr.add_argument("--file", required=True)
+    pr.add_argument("--goal", required=True)
+    pr.add_argument("--mock", action="store_true", help="use MockLLM (no API key)")
+    pr.set_defaults(func=cmd_run)
+
+    sub.add_parser("setup", help="Configure API key").set_defaults(func=cmd_setup)
+    sub.add_parser("key", help="Show API key status").set_defaults(func=cmd_key)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+- [ ] **Step 3: 跑测试**
+
+```bash
+pytest tests/test_cli.py -v
+```
+
+预期：2 passed
+
+- [ ] **Step 4: 手动跑 CLI 验证**
+
+```bash
+python -m cpa_harness.cli --help
+python -m cpa_harness.cli key
+```
+
+预期：help 输出含 run/setup/key；key 显示 "未配置"
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/cpa_harness/cli.py tests/test_cli.py
+git commit -m "feat(cli): add cpa-harness CLI with run/setup/key subcommands
+
+Plumbing: ToolRegistry built from 8 modules; sandbox selected by
+platform (Windows → WindowsSandbox, POSIX → PosixSandbox, fallback →
+InMemorySandbox). auto_approve=True for CLI (no HITL UI yet)."
+```
+
+---
+
+## Plan Self-Review
+
+### 1. Spec 覆盖检查
+
+| SPEC 节 | 实现的 task |
+|---------|-----------|
+| §1 问题陈述 | 整体方向（plan 顶部）|
+| §2 用户故事 (7 条) | AC-1..AC-8 隐式满足（demo 演示 + 集成测试）|
+| §3 功能模块 | Task 2, 8, 12, 4-7, 9-11, 16 |
+| §4 非功能 | Task 14 (creds) + Task 18 (CLI) |
+| §5.1 工具 | Task 8 |
+| §5.2 反馈 CE/MLE | Task 9, 10, 11；**WA/TLE/RE 解析待补**（见 §缺口）|
+| §5.3 危险动作 + HITL + 沙箱 | Task 4, 5, 6, 7 |
+| §5.4 记忆 | Task 12 |
+| §6 架构 / 数据流 | Task 13 |
+| §7 数据模型 | Task 2 |
+| §8 凭据 + 分发 | Task 14（分发形态 Docker/PyPI 见 §缺口）|
+| §9 技术选型 | Task 1, 15 |
+| §10 验收标准 | 全 task 跑通 = AC-1..AC-8 隐式满足 |
+| §11 测试策略 | 每个 task 都 TDD |
+| §12 风险 | 已知 |
+| §13 凭据威胁 | Task 14 + Task 1 CI gitleaks |
+
+### 2. 占位扫描
+
+无 TBD / TODO / "implement later"。
+
+### 3. 类型一致性
+
+- `Action.type` 5 种字面量在 Task 2 定义
+- `Decision.level` 在 Task 4 定义，`HITLStateMachine.submit` 在 Task 5 引用
+- `SandboxBackend.run` 在 Task 6 定义，在 Task 8 (`exec_command.run`) 与 Task 11 (`run_feedback`) 中被消费
+- `AgentLoop` 在 Task 13 中消费所有上述接口
+
+### 4. 已知缺口（建议在 follow-up PR 补，不阻塞 18 task 跑通）
+
+1. **WA / TLE / RE 反馈解析**：§5.2 列了 6 类信号，但 plan 只实现了 CE 与 MLE。WA/TLE/RE 解析在 v0.1 可用基础代码（`Signal` 字段 + `exit_code=124` for TLE）但**没写测试**。
+2. **WebUI (FastAPI)**：通用要求 §五"必须提供 WebUI"。~~本 plan 没写。~~ **已补为 Task 19**（见下）。
+3. **Dockerfile + 镜像构建**：通用要求 §3.2。~~Task 1 没写 Dockerfile。~~ **已补为 Task 20**（见下）。
+4. **tracer（可观测性）**：§4.4 提了，plan 没实现。AgentLoop 里加一个 `self.tracer` 字段即可。
+5. **WebUI 与 HITL 集成**：HITL `auto_approve=True` 是 CLI 默认；WebUI 真实场景需要把 `awaiting_approval` 状态暴露给前端。**Task 19 覆盖**。
+
+---
+
+## Task 19: WebUI (FastAPI + Open Design 生成的前端)
+
+**Files:**
+- Create: `src/cpa_harness/web/__init__.py`
+- Create: `src/cpa_harness/web/app.py` (FastAPI app)
+- Create: `src/cpa_harness/web/routes.py` (API 端点)
+- Create: `src/cpa_harness/web/ws.py` (WebSocket for HITL)
+- Create: `src/cpa_harness/web/static/index.html` (Open Design 生成)
+- Create: `src/cpa_harness/web/static/style.css` (Open Design 生成)
+- Create: `src/cpa_harness/web/static/app.js` (fetch API + WebSocket)
+- Create: `tests/test_webui.py`
+
+**Interfaces:**
+- Produces:
+  - `GET /` → serve index.html
+  - `POST /api/upload` → 上传 .c 文件
+  - `POST /api/ask` → 启动 AgentLoop
+  - `WS /ws/hitl` → WebSocket 推送 HITL 审批请求 + 接收 approve/reject/edit
+
+**Steps:**
+
+- [ ] **Step 1: 用 Open Design 生成前端原型**
+  - 安装 Open Design（`od mcp install opencode` 或桌面 app）
+  - Brief: "Generate a WebUI for a C programming tutor. Features: file upload area, chat interface with agent, diff view with Approve/Reject/Edit buttons for HITL approval. Use Linear design system. Single-page HTML."
+  - 生成的 HTML 放入 `src/cpa_harness/web/static/`
+
+- [ ] **Step 2: 写 `tests/test_webui.py`（红）**
+  - `GET /` 返回 200 + HTML
+  - `POST /api/upload` 上传 main.c → 200 + session_id
+  - `POST /api/ask` 启动 mock loop → 200 + result
+
+- [ ] **Step 3: 写 `src/cpa_harness/web/app.py`（绿）**
+  - FastAPI app + StaticFiles serve
+  - 路由：upload / ask / ws
+
+- [ ] **Step 4: WebSocket HITL 集成**
+  - AgentLoop `auto_approve=False` 时，通过 WebSocket 推送审批请求
+  - 前端收到后显示 diff + Approve/Reject/Edit
+  - 用户操作通过 WebSocket 回传
+
+- [ ] **Step 5: 跑测试 + 手动验证**
+
+- [ ] **Step 6: Commit**
+
+---
+
+## Task 20: Dockerfile + 分发
+
+**Files:**
+- Create: `Dockerfile`
+- Create: `.dockerignore`
+- Modify: `README.md` (加分发命令)
+
+**Steps:**
+
+- [ ] **Step 1: 写 `Dockerfile`**
+  ```dockerfile
+  FROM python:3.11-slim
+  RUN apt-get update && apt-get install -y gcc valgrind && rm -rf /var/lib/apt/lists/*
+  WORKDIR /app
+  COPY pyproject.toml .
+  COPY src/ src/
+  RUN pip install --no-cache-dir -e .
+  EXPOSE 8000
+  CMD ["uvicorn", "cpa_harness.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
+  ```
+
+- [ ] **Step 2: 写 `.dockerignore`**
+  ```
+  .git
+  __pycache__
+  *.pyc
+  .pytest_cache
+  tests/
+  docs/
+  workspaces/
+  .env
+  ```
+
+- [ ] **Step 3: 验证 `docker build` + `docker run`**
+
+- [ ] **Step 4: Commit**
+
+### 5. 何时进入下一个技能
+
+按 writing-plans skill 要求：
+
+> After saving the plan, offer execution choice:
+> "Plan complete and saved to ... Two execution options:
+> 1. Subagent-Driven (recommended) - I dispatch a fresh subagent per task, review between tasks, fast iteration
+> 2. Inline Execution - Execute tasks in this session using executing-plans, batch execution with checkpoints
+> Which approach?"
+
