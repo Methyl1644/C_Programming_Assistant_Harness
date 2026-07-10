@@ -23,6 +23,8 @@ jobs:
 
   docker-build:
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - name: Build Docker image
@@ -33,3 +35,9 @@ jobs:
           sleep 3
           curl -sf http://localhost:8000/api/key/status | grep -q configured
           docker stop ci-test
+      - name: Push to GHCR
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker tag cpa-harness:ci ghcr.io/methyl1644/cpa-harness:latest
+          docker push ghcr.io/methyl1644/cpa-harness:latest
