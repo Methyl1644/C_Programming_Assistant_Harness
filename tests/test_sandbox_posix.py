@@ -21,7 +21,7 @@ def test_sandbox_clears_secret_env(monkeypatch):
                {"cmd": "echo OPENAI_KEY=$OPENAI_API_KEY"},
                cwd="/tmp")
     assert secret_value not in r.stdout, "secret leaked into child env"
-    assert "$OPENAI_API_KEY" in r.stdout
+    assert r.stdout.strip() == "OPENAI_KEY="
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
