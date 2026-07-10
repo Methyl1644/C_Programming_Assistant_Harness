@@ -114,6 +114,30 @@ docker run -p 8000:8000 -e OPENAI_API_KEY="sk-..." cpa-harness
 - **LLM 供应商**：当前接 OpenAI API，可通过 `LLMProvider` 抽象层扩展
 - **Python >= 3.11**：使用了 `type | None` 等 3.10+ 语法
 
+## 部署架构与 CI/CD
+
+### 公网访问
+
+WebUI 通过 Cloudflare Tunnel 暴露到公网：
+
+```
+用户浏览器 → Cloudflare Edge → cloudflared tunnel → Docker 容器 (uvicorn :8000)
+```
+
+- 公网 URL: `https://pickup-modular-goto-unfortunately.trycloudflare.com`
+- 本地启动: `docker run -p 8000:8000 cpa-harness`
+- 隧道启动: `cloudflared tunnel --url http://localhost:8000 --protocol http2`
+
+### CI/CD
+
+| 流程 | 平台 | 配置文件 | 说明 |
+|------|------|---------|------|
+| 单元测试 | GitHub Actions | `.github/workflows/ci.yml` | `unit-test` job: pytest |
+| Docker 构建 | GitHub Actions | `.github/workflows/ci.yml` | `docker-build` job: build + verify |
+| GitLab CI | GitLab | `.gitlab-ci.yml` | `unit-test` job (课程要求) |
+
+CI 状态: https://github.com/Methyl1644/C_Programming_Assistant_Harness/actions
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
