@@ -20,7 +20,7 @@ CP-AH 用**护栏优先**的 harness 解决这两点。
 
 ## Status
 
-✅ Core complete — 81 tests passing, WebUI live, Docker image builds.
+✅ Core complete — 126 tests passing, WebUI live, Docker image builds.
 
 See [`docs/superpowers/specs/`](docs/superpowers/specs/) for the design doc.
 
