@@ -312,14 +312,16 @@ git push -u origin main       # 第一次 push
 | Git Push | 1 / 1 | 100% |
 | SPEC_PROCESS.md | 1 / 1 | 100% |
 | 冷启动验证 | 1 / 1 | 100% |
-| 实现 (Task 1-18) | 7 / 18 | 39% |
+| 实现 (Task 1-18) | 18 / 18 | 100% |
 | 冷启动验证补全 | 1 / 1 | 100% |
-| WebUI + Docker + 部署 + 反思 | 0 / 4 | 0% |
-| **总进度** | **19 / 38** | **50%** |
+| WebUI (Task 19) | 1 / 1 | 100% |
+| Dockerfile (Task 20) | 1 / 1 | 100% |
+| REFLECTION.md | 1 / 1 | 100% |
+| **总进度** | **34 / 34** | **100%** |
 
 ### 下一步
 
-推 Task 8（Tool Registry + 8 工具）
+全部完成。126 tests passed, 6 skipped。Docker 镜像 build + run 验证通过。
 
 
 
