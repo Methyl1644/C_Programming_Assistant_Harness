@@ -1,5 +1,7 @@
 # C Programming Assistant Harness (CP-AH)
 
+**Repository**: https://github.com/Methyl1644/C_Programming_Assistant_Harness
+
 A guardrail-first Coding Agent Harness that helps **C language beginners**
 debug and learn. Built as the final project for the AI4SE course at Nanjing
 University.
